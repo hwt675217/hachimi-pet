@@ -16,7 +16,7 @@ fs.writeFileSync(
   JSON.stringify(
     {
       name: 'hachimi-pet-app',
-      version: '1.0.1',
+      version: '1.0.2',
       private: true,
       main: 'electron/main.cjs',
     },

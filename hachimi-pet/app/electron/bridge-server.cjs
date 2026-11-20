@@ -14,6 +14,7 @@ const {
 } = require('./telemetry-reader.cjs');
 const { readQuotaSummary } = require('./quota-reader.cjs');
 const { readUsageStats, readModelDetailStats } = require('./stats-reader.cjs');
+const { checkForUpdates, applyUpdate } = require('./updater.cjs');
 const {
   ANNOTATIONS_DIR,
   loadAntigravityCatalog,
@@ -364,6 +365,12 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/update/check') {
+      const info = await checkForUpdates();
+      sendJson(res, 200, info);
+      return;
+    }
+
     if (req.method === 'POST') {
       let body = {};
       try {
@@ -468,6 +475,12 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         if (typeof onQuit === 'function') {
           setTimeout(() => onQuit(), 40);
         }
+        return;
+      }
+
+      if (url.pathname === '/api/update/apply') {
+        const result = await applyUpdate({ onQuit });
+        sendJson(res, 200, result);
         return;
       }
     }

@@ -175,6 +175,7 @@ namespace HachimiPetShell
         private string _scheme = "astral";
         private string _roam = "free";
         private bool _soundOn = true;
+        private bool _updating = false;
 
         public OverlayForm(int port, string targetUrl, string trayIconPath, int ownerPid)
         {
@@ -756,6 +757,11 @@ namespace HachimiPetShell
 
             _trayMenu.Items.Add(new ToolStripSeparator());
 
+            var updateItem = new ToolStripMenuItem(_updating ? "⏳ 正在检测/更新..." : "⬆️ 检测并更新");
+            updateItem.Enabled = !_updating;
+            updateItem.Click += delegate { CheckAndApplyUpdate(); };
+            _trayMenu.Items.Add(updateItem);
+
             var reloadItem = new ToolStripMenuItem("🔄 刷新桌宠界面");
             reloadItem.Click += delegate
             {
@@ -783,6 +789,103 @@ namespace HachimiPetShell
             _appliedIgnore = null;
             ApplyMouseState();
             RebuildTrayMenu();
+        }
+
+        private void CheckAndApplyUpdate()
+        {
+            if (_updating) return;
+            _updating = true;
+            RebuildTrayMenu();
+            int port = _port;
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    string checkJson = HttpGet(string.Format("http://127.0.0.1:{0}/api/update/check", port), 25000);
+                    Dictionary<string, object> info = _json.Deserialize<Dictionary<string, object>>(checkJson);
+                    bool ok = info != null && info.ContainsKey("ok") && Convert.ToBoolean(info["ok"]);
+                    if (!ok)
+                    {
+                        string errMsg = info != null && info.ContainsKey("error") ? Convert.ToString(info["error"]) : "检查更新失败";
+                        throw new Exception(errMsg);
+                    }
+
+                    bool hasUpdate = info.ContainsKey("hasUpdate") && Convert.ToBoolean(info["hasUpdate"]);
+                    string curVer = info.ContainsKey("currentVersion") ? Convert.ToString(info["currentVersion"]) : "?";
+                    string latVer = info.ContainsKey("latestVersion") ? Convert.ToString(info["latestVersion"]) : "?";
+                    string notes = info.ContainsKey("notes") ? Convert.ToString(info["notes"]) : "";
+
+                    if (!hasUpdate)
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            _updating = false;
+                            RebuildTrayMenu();
+                            MessageBox.Show(
+                                string.Format("当前已是最新版本 (v{0})。", curVer),
+                                "Hachimi Pet 检测更新",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Information
+                            );
+                        });
+                        return;
+                    }
+
+                    string summary = string.IsNullOrEmpty(notes) ? "是否立即下载更新包并自动重启桌宠？" : (notes.Length > 360 ? notes.Substring(0, 360) + "..." : notes);
+                    DialogResult ans = DialogResult.No;
+                    Invoke((MethodInvoker)delegate
+                    {
+                        ans = MessageBox.Show(
+                            string.Format("发现新版本 v{0}（当前 v{1}）\n\n{2}\n\n是否立即下载并更新？（完成后将自动重启桌宠）", latVer, curVer, summary),
+                            "Hachimi Pet 发现新版本",
+                            MessageBoxButtons.YesNo,
+                            MessageBoxIcon.Question
+                        );
+                    });
+
+                    if (ans != DialogResult.Yes)
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            _updating = false;
+                            RebuildTrayMenu();
+                        });
+                        return;
+                    }
+
+                    string applyJson = HttpPostJsonWithResponse(string.Format("http://127.0.0.1:{0}/api/update/apply", port), "{}", 120000);
+                    Dictionary<string, object> applyInfo = _json.Deserialize<Dictionary<string, object>>(applyJson);
+                    bool applyOk = applyInfo != null && applyInfo.ContainsKey("ok") && Convert.ToBoolean(applyInfo["ok"]);
+                    if (!applyOk)
+                    {
+                        string errMsg = applyInfo != null && applyInfo.ContainsKey("error") ? Convert.ToString(applyInfo["error"]) : "应用更新失败";
+                        throw new Exception(errMsg);
+                    }
+
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (_tray != null)
+                        {
+                            _tray.ShowBalloonTip(2000, "Hachimi Pet", string.Format("正在更新至 v{0}，即将自动重启...", latVer), ToolTipIcon.Info);
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        _updating = false;
+                        RebuildTrayMenu();
+                        MessageBox.Show(
+                            "检查或下载更新失败：\n" + ex.Message,
+                            "Hachimi Pet 更新提示",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Warning
+                        );
+                    });
+                }
+            });
         }
 
         private void ExitEverything()
@@ -829,11 +932,12 @@ namespace HachimiPetShell
             }
         }
 
-        private static string HttpGet(string url)
+        private static string HttpGet(string url, int timeoutMs = 2000)
         {
             HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
             req.Method = "GET";
-            req.Timeout = 2000;
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
             using (HttpWebResponse res = (HttpWebResponse)req.GetResponse())
             using (StreamReader sr = new StreamReader(res.GetResponseStream(), Encoding.UTF8))
             {
@@ -841,19 +945,29 @@ namespace HachimiPetShell
             }
         }
 
-        private static void HttpPostJson(string url, string jsonBody)
+        private static void HttpPostJson(string url, string jsonBody, int timeoutMs = 2000)
+        {
+            HttpPostJsonWithResponse(url, jsonBody, timeoutMs);
+        }
+
+        private static string HttpPostJsonWithResponse(string url, string jsonBody, int timeoutMs = 2000)
         {
             byte[] bytes = Encoding.UTF8.GetBytes(jsonBody ?? "{}");
             HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
             req.Method = "POST";
             req.ContentType = "application/json; charset=utf-8";
             req.ContentLength = bytes.Length;
-            req.Timeout = 2000;
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
             using (Stream s = req.GetRequestStream())
             {
                 s.Write(bytes, 0, bytes.Length);
             }
-            using (HttpWebResponse res = (HttpWebResponse)req.GetResponse()) { }
+            using (HttpWebResponse res = (HttpWebResponse)req.GetResponse())
+            using (StreamReader sr = new StreamReader(res.GetResponseStream(), Encoding.UTF8))
+            {
+                return sr.ReadToEnd();
+            }
         }
     }
 }

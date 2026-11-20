@@ -206,6 +206,47 @@ function rebuildTrayMenu() {
     },
     { type: 'separator' },
     {
+      label: '⬆️ 检测并更新',
+      click: async () => {
+        try {
+          const checkRes = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/api/update/check`);
+          const info = await checkRes.json();
+          if (!checkRes.ok || !info.ok) {
+            throw new Error(info.error || `HTTP ${checkRes.status}`);
+          }
+          if (!info.hasUpdate) {
+            await dialog.showMessageBox({
+              type: 'info',
+              title: 'Hachimi Pet 检测更新',
+              message: `当前已是最新版本 (v${info.currentVersion})`,
+            });
+            return;
+          }
+          const choice = await dialog.showMessageBox({
+            type: 'question',
+            buttons: ['立即更新', '取消'],
+            defaultId: 0,
+            cancelId: 1,
+            title: '发现新版本',
+            message: `发现新版本 v${info.latestVersion}（当前 v${info.currentVersion}）`,
+            detail: info.notes ? info.notes.slice(0, 320) : '是否立即下载更新包并自动重启桌宠？',
+          });
+          if (choice.response !== 0) return;
+          const applyRes = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/api/update/apply`, { method: 'POST', body: '{}' });
+          const applyData = await applyRes.json();
+          if (!applyRes.ok || !applyData.ok) {
+            throw new Error(applyData.error || `HTTP ${applyRes.status}`);
+          }
+        } catch (err) {
+          await dialog.showMessageBox({
+            type: 'error',
+            title: 'Hachimi Pet 更新失败',
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+    },
+    {
       label: '🚪 退出哈基米桌宠',
       click: () => {
         app.isQuitting = true;
@@ -329,6 +370,10 @@ app.whenReady().then(async () => {
   bridge = createBridgeServer({
     port: DEFAULT_PORT,
     onShowPanel: () => {},
+    onQuit: () => {
+      app.isQuitting = true;
+      app.quit();
+    },
     onGetMouseState: () => ({
       clickThroughLocked,
       wantedCapture,
