@@ -28,6 +28,7 @@ const EMPTY_SNAPSHOT: BridgeSnapshot = {
   pendingMcpWaits: [],
   queuedCounts: {},
   subagents: [],
+  quota: null,
 };
 
 export function useBridgeSocket(

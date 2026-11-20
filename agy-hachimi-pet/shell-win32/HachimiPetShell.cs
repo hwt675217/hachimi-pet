@@ -294,6 +294,25 @@ namespace HachimiPetShell
             });
         }
 
+        private void ReportRendererLogAsync(string level, string source, string message)
+        {
+            int port = _port;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    string body = _json.Serialize(new Dictionary<string, object>
+                    {
+                        { "level", level ?? "error" },
+                        { "source", source ?? "webview2-shell" },
+                        { "message", message ?? "" }
+                    });
+                    HttpPostJson(string.Format("http://127.0.0.1:{0}/api/renderer-log", port), body);
+                }
+                catch { }
+            });
+        }
+
         private async void OnFormLoad(object sender, EventArgs e)
         {
             ExtendDwmGlass();
@@ -317,13 +336,47 @@ namespace HachimiPetShell
                 _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
                 _webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
                 _webView.CoreWebView2.Settings.AreDevToolsEnabled = false;
+                _webView.CoreWebView2.Settings.AreBrowserAcceleratorKeysEnabled = false;
 
                 string preloadScript = BuildPreloadScript(_port);
                 await _webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(preloadScript);
 
                 _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
-                _webView.CoreWebView2.NavigationCompleted += delegate
+                _webView.CoreWebView2.WindowCloseRequested += delegate(object s, object ev)
                 {
+                    ReportRendererLogAsync("warn", "webview2-shell", "Blocked WindowCloseRequested from document/accelerator");
+                };
+                _webView.CoreWebView2.NavigationStarting += delegate(object s, CoreWebView2NavigationStartingEventArgs ev)
+                {
+                    string uri = ev.Uri ?? "";
+                    string allowedPrefix = string.Format("http://127.0.0.1:{0}/", _port);
+                    if (!uri.StartsWith(allowedPrefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ev.Cancel = true;
+                        ReportRendererLogAsync("warn", "webview2-shell", "Blocked external navigation: " + uri);
+                    }
+                };
+                _webView.CoreWebView2.ProcessFailed += delegate(object s, CoreWebView2ProcessFailedEventArgs ev)
+                {
+                    ReportRendererLogAsync("error", "webview2-shell", "CoreWebView2 ProcessFailed: " + ev.ProcessFailedKind.ToString());
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (!IsDisposed && _webView != null && _webView.CoreWebView2 != null)
+                            {
+                                _webView.CoreWebView2.Navigate(_targetUrl);
+                            }
+                        });
+                    }
+                    catch { }
+                };
+                _webView.CoreWebView2.NavigationCompleted += delegate(object s, CoreWebView2NavigationCompletedEventArgs ev)
+                {
+                    if (!ev.IsSuccess)
+                    {
+                        ReportRendererLogAsync("error", "webview2-shell", "NavigationCompleted failed: " + ev.WebErrorStatus.ToString());
+                    }
                     _webViewReady = true;
                     ExtendDwmGlass();
                     _appliedIgnore = null;
@@ -616,6 +669,10 @@ namespace HachimiPetShell
             resetItem.Click += delegate { SendCommandToWeb("resetPosition"); };
             _trayMenu.Items.Add(resetItem);
 
+            var statsItem = new ToolStripMenuItem("📊 模型消耗与缓存统计");
+            statsItem.Click += delegate { SendCommandToWeb("openStats"); };
+            _trayMenu.Items.Add(statsItem);
+
             var schemeMenu = new ToolStripMenuItem("🎨 切换哈基米配色");
             string[][] schemes = new string[][]
             {
@@ -698,6 +755,20 @@ namespace HachimiPetShell
             _trayMenu.Items.Add(lockItem);
 
             _trayMenu.Items.Add(new ToolStripSeparator());
+
+            var reloadItem = new ToolStripMenuItem("🔄 刷新桌宠界面");
+            reloadItem.Click += delegate
+            {
+                try
+                {
+                    if (_webView != null && _webView.CoreWebView2 != null)
+                    {
+                        _webView.CoreWebView2.Navigate(_targetUrl);
+                    }
+                }
+                catch { }
+            };
+            _trayMenu.Items.Add(reloadItem);
 
             var exitItem = new ToolStripMenuItem("🚪 退出哈基米桌宠");
             exitItem.Click += delegate { ExitEverything(); };

@@ -1,6 +1,6 @@
 {
   "name": "agy-hachimi-pet",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Source workspace for Hachimi Pet (hachimi-pet) — Starry Catgirl Desktop Pet HUD for Google Antigravity",
   "main": "electron/main.cjs",

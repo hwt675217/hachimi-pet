@@ -12,6 +12,8 @@ const {
   buildCompactedTelemetry,
   readInitialTranscriptTelemetry,
 } = require('./telemetry-reader.cjs');
+const { readQuotaSummary } = require('./quota-reader.cjs');
+const { readUsageStats, readModelDetailStats } = require('./stats-reader.cjs');
 const {
   ANNOTATIONS_DIR,
   loadAntigravityCatalog,
@@ -248,6 +250,8 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
   /** @type {Set<string>} Known subagent/swarm child conversation IDs */
   const knownChildIds = new Set();
   let activeConversationId = null;
+  let quotaSummary = null;
+  let quotaPending = false;
 
   function shortTitleLabel(t, maxLen = 18) {
     const clean = String(t || '').replace(/\s+/g, ' ').trim();
@@ -313,6 +317,50 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
 
     if (req.method === 'GET' && url.pathname === '/api/state') {
       sendJson(res, 200, snapshotState());
+      return;
+    }
+
+    const buildTitleLookup = () => {
+      const map = new Map();
+      for (const proj of antigravityProjects) {
+        for (const c of proj.conversations || []) {
+          if (c.conversationId && c.title) map.set(c.conversationId, c.title);
+        }
+      }
+      for (const [cid, s] of sessions.entries()) {
+        if (s.title) map.set(cid, s.title);
+      }
+      return map;
+    };
+
+    if (req.method === 'GET' && url.pathname === '/api/stats') {
+      const preset = url.searchParams.get('preset') || '7d';
+      const start = url.searchParams.get('start') || '';
+      const end = url.searchParams.get('end') || '';
+      const stats = await readUsageStats({ preset, start, end, titleLookup: buildTitleLookup() });
+      sendJson(res, 200, stats);
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/stats/model') {
+      const model = url.searchParams.get('model') || 'unknown';
+      const preset = url.searchParams.get('preset') || '7d';
+      const start = url.searchParams.get('start') || '';
+      const end = url.searchParams.get('end') || '';
+      const tab = url.searchParams.get('tab') || 'turns';
+      const page = Number(url.searchParams.get('page') || 1);
+      const pageSize = Number(url.searchParams.get('pageSize') || 10);
+      const detail = await readModelDetailStats({
+        model,
+        preset,
+        start,
+        end,
+        tab,
+        page,
+        pageSize,
+        titleLookup: buildTitleLookup(),
+      });
+      sendJson(res, 200, detail);
       return;
     }
 
@@ -389,6 +437,21 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       if (url.pathname === '/api/host-state') {
         if (body && typeof body === 'object') {
           hostMouseState = { ...body, updatedAt: Date.now() };
+        }
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (url.pathname === '/api/renderer-log') {
+        if (body && typeof body === 'object') {
+          rendererLogs.push({
+            level: String(body.level || 'error'),
+            source: String(body.source || 'renderer'),
+            message: String(body.message || ''),
+            stack: body.stack ? String(body.stack).slice(0, 1600) : '',
+            ts: Date.now(),
+          });
+          if (rendererLogs.length > 50) rendererLogs.shift();
         }
         sendJson(res, 200, { ok: true });
         return;
@@ -498,7 +561,33 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         Array.from(queuedMessages.entries()).map(([k, arr]) => [k, arr.length])
       ),
       subagents: subagentTracker ? subagentTracker.getPublicList() : [],
+      quota: quotaSummary,
     };
+  }
+
+  function quotaSignature(q) {
+    if (!q || !Array.isArray(q.groups)) return '';
+    return q.groups
+      .map((g) => `${g.id}:${g.fiveHour?.remainingPercent ?? ''}:${g.fiveHour?.resetTime ?? ''}:${g.weekly?.remainingPercent ?? ''}:${g.weekly?.resetTime ?? ''}`)
+      .join('|');
+  }
+
+  function refreshQuotaSummary() {
+    if (quotaPending) return;
+    quotaPending = true;
+    readQuotaSummary()
+      .then((nextQuota) => {
+        if (!nextQuota) return;
+        const changed = quotaSignature(quotaSummary) !== quotaSignature(nextQuota);
+        quotaSummary = nextQuota;
+        if (changed) {
+          broadcast('state:sync', snapshotState());
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        quotaPending = false;
+      });
   }
 
   subagentTracker = new SubagentTracker({
@@ -633,6 +722,32 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       .finally(() => {
         telemetryPending.delete(cid);
       });
+  }
+
+  function applySessionCanceled(s, { quiet = false, announce = true } = {}) {
+    if (!s) return;
+    s.status = 'AWAITING_NEXT';
+    s.lastCancelAt = Date.now();
+    const label = shortTitleLabel(s.title || s.projectName);
+    s.badge = label ? `⏸️ 已取消 · ${label}` : '⏸️ 已暂停，等待下一步指令';
+    for (const [aid, appr] of pendingApprovals.entries()) {
+      if (appr.conversationId === s.conversationId) {
+        clearTimeout(appr.timer);
+        pendingApprovals.delete(aid);
+        try { appr.resolve({ decision: 'deny', reason: 'Canceled by user' }); } catch {}
+      }
+    }
+    subagentTracker?.handleParentCanceled?.(s.conversationId);
+    if (!quiet) {
+      broadcast('pet:Reaction', {
+        expression: announce ? 'surprised' : 'neutral',
+        motion: announce ? 'look' : null,
+        speech: announce ? '已紧急刹车！下一步想怎么改告诉我吧～' : undefined,
+        badge: s.badge,
+        thinking: false,
+      });
+      broadcast('state:sync', snapshotState());
+    }
   }
 
   function popQueuedMessages(cid) {
@@ -796,6 +911,8 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
 
       case 'PostInvocation': {
         refreshSessionTelemetry(s.conversationId);
+        refreshQuotaSummary();
+        setTimeout(() => refreshQuotaSummary(), 1400);
         const queued = popQueuedMessages(s.conversationId);
         if (queued.length > 0) {
           const combined = queued.map((m) => m.text).join('\n');
@@ -841,6 +958,13 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         if (reason === 'ERROR' || payload.error) {
           s.status = 'ERROR';
           s.badge = `🚨 执行异常中断 (${reason})`;
+          for (const [aid, appr] of pendingApprovals.entries()) {
+            if (appr.conversationId === s.conversationId) {
+              clearTimeout(appr.timer);
+              pendingApprovals.delete(aid);
+              try { appr.resolve({ decision: 'deny', reason: 'Turn errored' }); } catch {}
+            }
+          }
           broadcast('pet:Reaction', {
             expression: 'cry',
             motion: 'shiver',
@@ -848,16 +972,10 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
             badge: s.badge,
             thinking: false,
           });
-        } else if (reason === 'USER_CANCELED') {
-          s.status = 'AWAITING_NEXT';
-          s.badge = '⏸️ 已暂停，等待下一步指令';
-          broadcast('pet:Reaction', {
-            expression: 'surprised',
-            motion: 'look',
-            speech: '已紧急刹车！下一步想怎么改告诉我吧～',
-            badge: s.badge,
-            thinking: false,
-          });
+        } else if (/CANCEL/i.test(reason)) {
+          applySessionCanceled(s, { quiet: false, announce: true });
+          refreshSessionTelemetry(s.conversationId);
+          return { decision: 'stop' };
         } else {
           s.status = 'AWAITING_NEXT';
           s.badge = '🎉 本轮任务已完成';
@@ -1118,6 +1236,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       s.telemetry = buildTranscriptTelemetry(ev.step, s.telemetry, s.lastInvocationStartMs);
       if (!ev.quiet) {
         refreshSessionTelemetry(ev.conversationId);
+        refreshQuotaSummary();
         broadcast('state:sync', snapshotState());
       }
       return;
@@ -1177,6 +1296,38 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
           thinking: pres.thinking,
         });
         broadcast('state:sync', snapshotState());
+      }
+    } else if (ev.kind === 'canceled') {
+      applySessionCanceled(s, { quiet: ev.quiet, announce: !ev.quiet });
+    } else if (ev.kind === 'turn_end') {
+      if (s.status !== 'IDLE' && s.status !== 'AWAITING_NEXT') {
+        s.status = 'AWAITING_NEXT';
+        const label = shortTitleLabel(s.title || s.projectName);
+        s.badge = label ? `🎉 已结束 · ${label}` : '🎉 本轮已结束';
+        if (!ev.quiet) {
+          broadcast('pet:Reaction', {
+            expression: 'neutral',
+            motion: null,
+            badge: s.badge,
+            thinking: false,
+          });
+          broadcast('state:sync', snapshotState());
+        }
+      }
+    } else if (ev.kind === 'error_step') {
+      if (/interrupt|cancel/i.test(ev.text || '')) {
+        s.lastCancelAt = Date.now();
+        s.status = 'AWAITING_NEXT';
+        s.badge = '⏸️ 对话流已中断';
+        if (!ev.quiet) {
+          broadcast('pet:Reaction', {
+            expression: 'surprised',
+            motion: 'look',
+            badge: s.badge,
+            thinking: false,
+          });
+          broadcast('state:sync', snapshotState());
+        }
       }
     } else if (ev.kind === 'ask_question') {
       s.status = 'WAITING_USER';
@@ -1469,6 +1620,9 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       allConvos.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
 
       // Pre-attach TranscriptWatcher to top 8 most recent root conversations so any prompt in any open window switches in <50ms!
+      // Also reconcile busy sessions back to AWAITING_NEXT/IDLE when SQLite conversation_summaries reports CASCADE_RUN_STATUS_IDLE
+      // (covers manual Cancel mid-stream or tool abort if the Stop hook was skipped or delayed).
+      const nowMs = Date.now();
       for (const c of allConvos.slice(0, 8)) {
         if (!sessions.has(c.conversationId)) {
           ensureSession({
@@ -1481,6 +1635,18 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
             preserveTimestamp: true,
             preserveSelection: true,
           });
+        } else if (String(c.status || '').toUpperCase().includes('IDLE')) {
+          const existing = sessions.get(c.conversationId);
+          const isBusy =
+            existing &&
+            ['THINKING', 'READING', 'CODING', 'RUNNING_CMD', 'WAITING_USER'].includes(existing.status);
+          const lastBusyAt = Math.max(existing?.lastInvocationStartMs || 0, existing?.updatedAt || 0);
+          if (isBusy && (c.updatedAt || 0) >= lastBusyAt - 200 && nowMs - lastBusyAt > 2500) {
+            applySessionCanceled(existing, {
+              quiet: c.conversationId !== activeConversationId,
+              announce: false,
+            });
+          }
         }
       }
 
@@ -1577,8 +1743,11 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
   } catch { /* fallback timer handles it */ }
 
   refreshCatalog();
+  refreshQuotaSummary();
   const brainScanTimer = setInterval(refreshCatalog, 3000);
   brainScanTimer.unref?.();
+  const quotaScanTimer = setInterval(refreshQuotaSummary, 25000);
+  quotaScanTimer.unref?.();
 
   function start() {
     return new Promise((resolve, reject) => {
@@ -1599,6 +1768,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
 
   function close() {
     clearInterval(brainScanTimer);
+    clearInterval(quotaScanTimer);
     try { annotationWatcher?.close(); } catch { /* ignore */ }
     subagentTracker?.dispose();
     watcher.dispose();

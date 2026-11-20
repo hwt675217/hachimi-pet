@@ -146,6 +146,10 @@ function rebuildTrayMenu() {
       click: () => sendRendererCommand({ type: 'resetPosition' }),
     },
     {
+      label: '📊 模型消耗与缓存统计',
+      click: () => sendRendererCommand({ type: 'openStats' }),
+    },
+    {
       label: '🎨 切换哈基米配色',
       submenu: schemes.map(([id, label]) => ({
         label,

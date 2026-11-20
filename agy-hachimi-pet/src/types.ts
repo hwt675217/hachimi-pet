@@ -119,6 +119,173 @@ export interface SubagentItem {
   updatedAt: number;
 }
 
+export interface QuotaBucket {
+  bucketId: string;
+  window: string;
+  remainingFraction: number;
+  remainingPercent: number;
+  usedPercent?: number;
+  resetTime: string;
+  description?: string;
+}
+
+export interface QuotaGroup {
+  id: string;
+  displayName: string;
+  shortName: string;
+  modelsSummary: string;
+  fiveHour: QuotaBucket | null;
+  weekly: QuotaBucket | null;
+}
+
+export interface QuotaSummary {
+  groups: QuotaGroup[];
+  defaultGroupIndex: number;
+  updatedAt: number;
+}
+
+export interface UsageModelBreakdown {
+  model: string;
+  label: string;
+  family: 'gemini' | 'claude' | 'gpt' | 'other';
+  turns: number;
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cacheHitRate: number;
+  sharePercent: number;
+  toolCalls: number;
+}
+
+export interface UsageTrendBucket {
+  key: string;
+  label: string;
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cacheHitRate: number;
+  turns: number;
+}
+
+export interface UsageToolItem {
+  name: string;
+  count: number;
+  sharePercent: number;
+}
+
+export interface UsageConvoItem {
+  conversationId: string;
+  title: string;
+  isSubagent: boolean;
+  turns: number;
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cacheHitRate: number;
+  primaryModel: string;
+  primaryFamily: 'gemini' | 'claude' | 'gpt' | 'other';
+  updatedAt: number;
+}
+
+export interface UsageStatsResponse {
+  range: {
+    preset: 'today' | '7d' | '30d' | 'all' | 'custom';
+    startDate: string;
+    endDate: string;
+  };
+  summary: {
+    totalTokens: number;
+    inputTokens: number;
+    cacheReadTokens: number;
+    outputTokens: number;
+    totalPromptTokens: number;
+    cacheHitRate: number;
+    turns: number;
+    rootTurns: number;
+    subagentTurns: number;
+    rootTokens: number;
+    subagentTokens: number;
+    conversations: number;
+    toolCalls: number;
+    avgTokensPerTurn: number;
+  };
+  byModel: UsageModelBreakdown[];
+  trend: {
+    granularity: 'hour' | 'day';
+    buckets: UsageTrendBucket[];
+  };
+  topTools: UsageToolItem[];
+  topConversations: UsageConvoItem[];
+  updatedAt: number;
+}
+
+export interface ModelTurnDetailItem {
+  tsMs: number;
+  conversationId: string;
+  title: string;
+  isSubagent: boolean;
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cacheHitRate: number;
+  tools: string[];
+}
+
+export interface ModelConvoDetailItem {
+  conversationId: string;
+  title: string;
+  isSubagent: boolean;
+  turns: number;
+  inputTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cacheHitRate: number;
+  toolCalls: number;
+  updatedAt: number;
+}
+
+export interface ModelDetailStatsResponse {
+  model: string;
+  label: string;
+  family: 'gemini' | 'claude' | 'gpt' | 'other';
+  range: {
+    preset: string;
+    startDate: string;
+    endDate: string;
+  };
+  summary: {
+    totalTokens: number;
+    inputTokens: number;
+    cacheReadTokens: number;
+    outputTokens: number;
+    cacheHitRate: number;
+    turns: number;
+    rootTurns: number;
+    subagentTurns: number;
+    rootTokens: number;
+    subagentTokens: number;
+    conversations: number;
+    toolCalls: number;
+    avgTokensPerTurn: number;
+  };
+  topTools: UsageToolItem[];
+  tab: 'turns' | 'conversations';
+  pagination: {
+    page: number;
+    pageSize: number;
+    totalItems: number;
+    totalPages: number;
+    turnsTotal: number;
+    conversationsTotal: number;
+  };
+  items: Array<ModelTurnDetailItem | ModelConvoDetailItem>;
+}
+
 export interface BridgeSnapshot {
   settings: PetSettings;
   activeConversationId: string | null;
@@ -129,6 +296,7 @@ export interface BridgeSnapshot {
   pendingMcpWaits: PendingMcpWait[];
   queuedCounts: Record<string, number>;
   subagents?: SubagentItem[];
+  quota?: QuotaSummary | null;
 }
 
 export interface PetReactionEvent {

@@ -217,7 +217,33 @@ class TranscriptWatcher extends EventEmitter {
       return;
     }
     const type = String(step.type || '').toUpperCase();
+    const stepStatus = String(step.status || '').toUpperCase();
     const createdAt = step.created_at || new Date().toISOString();
+
+    if (stepStatus.includes('CANCEL')) {
+      this.emit('step', {
+        conversationId,
+        kind: 'canceled',
+        step,
+        createdAt,
+        quiet: quietHistorical,
+      });
+      return;
+    }
+
+    if (type.includes('ERROR_MESSAGE')) {
+      const errText = typeof step.content === 'string' ? step.content.trim() : '';
+      if (errText) {
+        this.emit('step', {
+          conversationId,
+          kind: 'error_step',
+          text: errText,
+          createdAt,
+          quiet: quietHistorical,
+        });
+      }
+      return;
+    }
 
     if (type.includes('USER_INPUT')) {
       const text = cleanUserContent(step.content);

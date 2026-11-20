@@ -500,6 +500,27 @@ class SubagentTracker {
   }
 
   /**
+   * Retire any active subagent / Swarm catgirls belonging to a parent session that was canceled or became idle.
+   */
+  handleParentCanceled(parentConversationId) {
+    if (!parentConversationId) return;
+    let changed = false;
+    for (const it of Array.from(this.items.values())) {
+      if (it.source === 'test') continue;
+      if (it.parentConversationId === parentConversationId || it.conversationId === parentConversationId) {
+        this._finishAndRemove(it.id, { permanent: true, silent: true });
+        changed = true;
+      }
+    }
+    if (this.pendingByParent.has(parentConversationId)) {
+      this.pendingByParent.delete(parentConversationId);
+    }
+    if (changed) {
+      this.onChange();
+    }
+  }
+
+  /**
    * Called ONLY when a Swarm coordinator explicitly posts `[done]` (or explicit manual cleanup).
    * Never called merely because a parent paused its dispatch turn while waiting for async children!
    */
