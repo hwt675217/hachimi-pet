@@ -128,7 +128,7 @@ function createTrayIcon() {
 
 function rebuildTrayMenu() {
   if (!tray) return;
-  const s = bridge?.getSettings?.() || { scheme: 'astral', outfit: 'maid', roam: 'free', soundOn: true };
+  const s = bridge?.getSettings?.() || { scheme: 'astral', outfit: 'maid', roam: 'free', scale: 0.95, opacity: 1, soundOn: true };
   const schemes = [
     ['astral', '星瞳紫 (Astral · 原设)'],
     ['sakura', '樱桃粉 (Sakura)'],
@@ -157,6 +157,30 @@ function rebuildTrayMenu() {
         checked: s.scheme === id || (id === 'astral' && s.scheme === 'gemini'),
         click: () => {
           bridge?.updateSettings?.({ scheme: id, outfit: 'maid' });
+          rebuildTrayMenu();
+        },
+      })),
+    },
+    {
+      label: '📏 桌宠大小',
+      submenu: [0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1, 1.1].map((scale) => ({
+        label: `${Math.round(scale * 100)}%`,
+        type: 'radio',
+        checked: Math.abs((s.scale ?? 0.95) - scale) < 0.001,
+        click: () => {
+          bridge?.updateSettings?.({ scale });
+          rebuildTrayMenu();
+        },
+      })),
+    },
+    {
+      label: '👻 桌宠透明度',
+      submenu: [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4].map((opacity) => ({
+        label: opacity >= 0.999 ? '100% (不透明)' : `${Math.round(opacity * 100)}%`,
+        type: 'radio',
+        checked: Math.abs((s.opacity ?? 1) - opacity) < 0.001,
+        click: () => {
+          bridge?.updateSettings?.({ opacity });
           rebuildTrayMenu();
         },
       })),

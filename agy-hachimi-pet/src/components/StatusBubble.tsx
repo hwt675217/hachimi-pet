@@ -11,6 +11,7 @@ interface StatusBubbleProps {
   quota?: QuotaSummary | null;
   onClickBadge?: () => void;
   onOpenStats?: () => void;
+  opacity?: number;
 }
 
 const STATUS_DOT_CLASS: Record<PetExecutionStatus, string> = {
@@ -79,6 +80,7 @@ export const StatusBubble: React.FC<StatusBubbleProps> = ({
   quota,
   onClickBadge,
   onOpenStats,
+  opacity = 1,
 }) => {
   const [typedSpeech, setTypedSpeech] = useState('');
 
@@ -142,7 +144,7 @@ export const StatusBubble: React.FC<StatusBubbleProps> = ({
   return (
     <div
       className="status-bubble-wrap dynamic-head-wrap"
-      style={{ left: `${clampedX}px`, top: `${clampedY}px` }}
+      style={{ left: `${clampedX}px`, top: `${clampedY}px`, opacity }}
     >
       {/* Transient Speech / Live Thinking Island */}
       {typedSpeech ? (

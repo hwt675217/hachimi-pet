@@ -739,6 +739,7 @@ export const WhaleStage = forwardRef<WhaleControllerHandle, WhaleStageProps>(fun
     <div
       ref={stageRef}
       className="whale-stage"
+      style={{ opacity: settings.opacity ?? 1 }}
       onPointerDown={(e) => {
         if (e.button === 2) {
           const ptR = toStagePoint(e);

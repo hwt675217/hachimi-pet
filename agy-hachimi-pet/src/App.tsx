@@ -94,6 +94,7 @@ export const App: React.FC = () => {
             quota={snapshot.quota || null}
             onClickBadge={handlePetCheer}
             onOpenStats={handleToggleStats}
+            opacity={snapshot.settings.opacity ?? 1}
           />
         </ErrorBoundary>
 

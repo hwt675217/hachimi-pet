@@ -66,6 +66,7 @@ function loadSettings() {
     autoSchemeByModel: false,   // Auto-switch color scheme based on modelName
     roam: 'free',               // 'free' | 'off' (pinned corner)
     scale: 0.95,
+    opacity: 1.0,
     soundOn: true,
     safetyGateEnabled: false,   // Toggle PreToolUse hook on run_command
     interceptRiskyOnly: true,   // Pop Allow/Deny bubble on risky run_command

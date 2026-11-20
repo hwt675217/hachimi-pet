@@ -8,6 +8,7 @@ const DEFAULT_SETTINGS: PetSettings = {
   autoSchemeByModel: false,
   roam: 'free',
   scale: 0.95,
+  opacity: 1,
   soundOn: true,
   safetyGateEnabled: false,
   interceptRiskyOnly: true,
