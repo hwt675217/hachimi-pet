@@ -174,6 +174,8 @@ namespace HachimiPetShell
 
         private string _scheme = "astral";
         private string _roam = "free";
+        private double _scale = 0.95;
+        private double _opacity = 1.0;
         private bool _soundOn = true;
         private bool _updating = false;
 
@@ -641,6 +643,8 @@ namespace HachimiPetShell
                     {
                         if (st.ContainsKey("scheme")) _scheme = Convert.ToString(st["scheme"]) ?? "astral";
                         if (st.ContainsKey("roam")) _roam = Convert.ToString(st["roam"]) ?? "free";
+                        if (st.ContainsKey("scale")) _scale = Convert.ToDouble(st["scale"]);
+                        if (st.ContainsKey("opacity")) _opacity = Convert.ToDouble(st["opacity"]);
                         if (st.ContainsKey("soundOn")) _soundOn = Convert.ToBoolean(st["soundOn"]);
                         BeginInvoke((MethodInvoker)delegate { RebuildTrayMenu(); });
                     }
@@ -701,6 +705,45 @@ namespace HachimiPetShell
                 schemeMenu.DropDownItems.Add(item);
             }
             _trayMenu.Items.Add(schemeMenu);
+
+            var sizeMenu = new ToolStripMenuItem("📏 桌宠大小");
+            double[] sizeValues = new double[] { 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0, 1.1 };
+            foreach (double sizeValue in sizeValues)
+            {
+                double value = sizeValue;
+                var item = new ToolStripMenuItem(string.Format("{0}%", (int)Math.Round(value * 100)));
+                item.Checked = Math.Abs(_scale - value) < 0.001;
+                item.Click += delegate
+                {
+                    _scale = value;
+                    PostSettingsPatch(new Dictionary<string, object> { { "scale", value } });
+                    RebuildTrayMenu();
+                };
+                sizeMenu.DropDownItems.Add(item);
+            }
+            _trayMenu.Items.Add(sizeMenu);
+
+            var hudSettingsItem = new ToolStripMenuItem("头顶文字设置…");
+            hudSettingsItem.Click += delegate { SendCommandToWeb("openHudSettings"); };
+            _trayMenu.Items.Add(hudSettingsItem);
+
+            var opacityMenu = new ToolStripMenuItem("👻 桌宠透明度");
+            double[] opacityValues = new double[] { 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4 };
+            foreach (double opacityValue in opacityValues)
+            {
+                double value = opacityValue;
+                string label = value >= 0.999 ? "100% (不透明)" : string.Format("{0}%", (int)Math.Round(value * 100));
+                var item = new ToolStripMenuItem(label);
+                item.Checked = Math.Abs(_opacity - value) < 0.001;
+                item.Click += delegate
+                {
+                    _opacity = value;
+                    PostSettingsPatch(new Dictionary<string, object> { { "opacity", value } });
+                    RebuildTrayMenu();
+                };
+                opacityMenu.DropDownItems.Add(item);
+            }
+            _trayMenu.Items.Add(opacityMenu);
 
             var subMenu = new ToolStripMenuItem("🐱 子代理预览");
             var spawnItem = new ToolStripMenuItem("✨ 召唤测试子代理 (天降与淡出)");

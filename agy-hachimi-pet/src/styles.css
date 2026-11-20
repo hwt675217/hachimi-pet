@@ -31,6 +31,7 @@ body,
 }
 
 .desktop-overlay-root {
+  --pet-ui-scale: 1;
   position: relative;
   width: 100%;
   height: 100%;
@@ -76,13 +77,14 @@ body,
 .status-bubble-wrap {
   position: absolute;
   z-index: 20;
-  transform: translate(-50%, -100%);
+  transform: translate(-50%, -100%) scale(var(--pet-ui-scale, 1));
+  transform-origin: 50% 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
   pointer-events: none;
-  transition: left 0.06s linear, top 0.06s linear;
+  transition: left 0.06s linear, top 0.06s linear, transform 0.18s ease-out;
 }
 
 .dynamic-speech-cloud,
@@ -1155,7 +1157,8 @@ body,
 
 .subagent-hud-card {
   position: absolute;
-  transform: translate(-50%, -100%);
+  transform: translate(-50%, -100%) scale(var(--pet-ui-scale, 1));
+  transform-origin: 50% 100%;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1171,22 +1174,22 @@ body,
 
 .subagent-hud-card.is-exiting {
   opacity: 0 !important;
-  transform: translate(-50%, -122%) scale(0.92) !important;
+  transform: translate(-50%, -122%) scale(var(--pet-ui-scale, 1)) scale(0.92) !important;
   pointer-events: none !important;
 }
 
 @keyframes dropLandBounce {
   0% {
     opacity: 0;
-    transform: translate(-50%, -170%) scale(0.8);
+    transform: translate(-50%, -170%) scale(var(--pet-ui-scale, 1)) scale(0.8);
   }
   65% {
     opacity: 1;
-    transform: translate(-50%, -92%) scale(1.05);
+    transform: translate(-50%, -92%) scale(var(--pet-ui-scale, 1)) scale(1.05);
   }
   100% {
     opacity: 1;
-    transform: translate(-50%, -100%) scale(1);
+    transform: translate(-50%, -100%) scale(var(--pet-ui-scale, 1));
   }
 }
 
@@ -1718,6 +1721,49 @@ body,
   pointer-events: auto;
   overflow: hidden;
   animation: popIn 0.18s ease-out;
+}
+
+.hud-settings-panel {
+  left: 22px;
+  right: auto;
+  width: min(300px, calc(100vw - 44px));
+  overflow: auto;
+}
+
+.hud-settings-panel .stats-title {
+  margin: 0;
+}
+
+.hud-settings-controls {
+  display: grid;
+  gap: 12px;
+  padding: 12px 14px;
+  font-size: 12px;
+}
+
+.hud-settings-controls label {
+  display: grid;
+  gap: 5px;
+}
+
+.hud-settings-controls label > span {
+  display: flex;
+  justify-content: space-between;
+}
+
+.hud-settings-controls input {
+  margin: 0;
+}
+
+.hud-settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.hud-settings-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .stats-header {
