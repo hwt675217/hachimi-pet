@@ -2,15 +2,17 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { WhaleStage, type WhaleControllerHandle } from './components/WhaleStage';
 import { StatusBubble } from './components/StatusBubble';
 import { ApprovalPopover } from './components/ApprovalPopover';
+import { HudSettingsPanel } from './components/HudSettingsPanel';
 import { StatsPanel } from './components/StatsPanel';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { useBridgeSocket } from './hooks/useBridgeSocket';
-import type { PetReactionEvent } from './types';
+import type { PetReactionEvent, PetSettings } from './types';
 
 export const App: React.FC = () => {
   const whaleRef = useRef<WhaleControllerHandle | null>(null);
   const [speechText, setSpeechText] = useState('');
   const [statsOpen, setStatsOpen] = useState(false);
+  const [hudDraft, setHudDraft] = useState<Partial<Pick<PetSettings, 'hudScale' | 'hudGap'>> | null>(null);
   const [anchorPos, setAnchorPos] = useState({
     x: window.innerWidth - 150,
     y: window.innerHeight - 235,
@@ -30,6 +32,8 @@ export const App: React.FC = () => {
       whaleRef.current?.resetCornerPosition();
     } else if (cmd?.type === 'openStats') {
       setStatsOpen((v) => !v);
+    } else if (cmd?.type === 'openHudSettings') {
+      setHudDraft((draft) => draft ?? {});
     }
   }, []);
 
@@ -39,6 +43,7 @@ export const App: React.FC = () => {
     liveThinking,
     resolveApproval,
     reportDiag,
+    updateSettings,
   } = useBridgeSocket(handleReaction, handleHostCommand);
 
   // Listen for native host commands (Electron IPC / WebView2 WebMessage)
@@ -69,19 +74,22 @@ export const App: React.FC = () => {
   }, []);
 
   const bridgePort = window.petHost?.bridgePort || 17890;
-  const petUiScale = Math.min(1, Math.max(0.5, snapshot.settings.scale ?? 1));
+  const hudScale = hudDraft?.hudScale ?? snapshot.settings.hudScale ?? 1;
+  const hudGap = hudDraft?.hudGap ?? snapshot.settings.hudGap ?? 6;
 
   return (
     <ErrorBoundary name="root" bridgePort={bridgePort} autoRecoverMs={1200}>
       <div
         className="desktop-overlay-root"
-        style={{ '--pet-ui-scale': String(petUiScale) } as React.CSSProperties}
+        style={{ '--pet-ui-scale': String(hudScale) } as React.CSSProperties}
       >
         <ErrorBoundary name="whale-stage" bridgePort={bridgePort} autoRecoverMs={1500}>
           <WhaleStage
             ref={whaleRef}
             settings={snapshot.settings}
             subagents={snapshot.subagents}
+            hudScale={hudScale}
+            hudGap={hudGap}
             onAnchorMove={setAnchorPos}
             onDiag={reportDiag}
           />
@@ -99,6 +107,8 @@ export const App: React.FC = () => {
             onClickBadge={handlePetCheer}
             onOpenStats={handleToggleStats}
             opacity={snapshot.settings.opacity ?? 1}
+            hudScale={hudScale}
+            hudGap={hudGap}
           />
         </ErrorBoundary>
 
@@ -141,6 +151,21 @@ export const App: React.FC = () => {
             onClose={handleCloseStats}
           />
         </ErrorBoundary>
+
+        {hudDraft !== null && (
+          <HudSettingsPanel
+            scale={hudScale}
+            gap={hudGap}
+            connected={connected}
+            onScaleChange={(hudScale) => setHudDraft((draft) => ({ ...draft, hudScale }))}
+            onGapChange={(hudGap) => setHudDraft((draft) => ({ ...draft, hudGap }))}
+            onCancel={() => setHudDraft(null)}
+            onSave={() => {
+              if (Object.keys(hudDraft).length > 0) updateSettings(hudDraft);
+              setHudDraft(null);
+            }}
+          />
+        )}
 
         <ErrorBoundary name="approval-popover" bridgePort={bridgePort}>
           <ApprovalPopover

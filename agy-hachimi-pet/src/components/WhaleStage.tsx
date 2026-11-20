@@ -48,6 +48,8 @@ export interface WhaleControllerHandle {
 interface WhaleStageProps {
   settings: PetSettings;
   subagents?: SubagentItem[];
+  hudScale: number;
+  hudGap: number;
   onAnchorMove?: (pos: { x: number; y: number; sideX: number; sideY: number }) => void;
   onDiag?: (diag: Record<string, unknown>) => void;
 }
@@ -75,28 +77,30 @@ function computeSubagentLaneX(slotIndex: number, stageWidth: number): number {
 function resolveHudLayout(
   subagents: SubagentItem[],
   anchors: Record<string, { x: number; y: number }>,
-  stageWidth: number
+  stageWidth: number,
+  hudScale: number,
+  hudGap: number
 ): Record<string, { x: number; y: number }> {
   const placed: Array<{ id: string; x: number; y: number }> = [];
   const sorted = [...subagents]
     .filter((s) => Boolean(anchors[s.id]))
     .sort((a, b) => (anchors[a.id]?.x ?? 0) - (anchors[b.id]?.x ?? 0));
 
-  const minX = 92;
-  const maxX = Math.max(180, stageWidth - 92);
-  const pillHalfW = 86;
+  const minX = Math.min(stageWidth / 2, 110 * hudScale);
+  const maxX = stageWidth - minX;
+  const pillHalfW = 86 * hudScale;
 
   for (const sub of sorted) {
     const raw = anchors[sub.id];
-    let x = Math.max(minX, Math.min(maxX, raw.x));
-    let y = raw.y - 12;
+    const x = Math.max(minX, Math.min(maxX, raw.x));
+    let y = raw.y - hudGap;
 
     for (const prev of placed) {
       const dx = Math.abs(x - prev.x);
       const dy = Math.abs(y - prev.y);
-      if (dx < pillHalfW * 1.85 && dy < 46) {
+      if (dx < pillHalfW * 1.85 && dy < 46 * hudScale) {
         // Stack vertically above the neighboring pill if whales are standing very close
-        y = prev.y - 52;
+        y = prev.y - 52 * hudScale;
       }
     }
     placed.push({ id: sub.id, x, y });
@@ -151,7 +155,7 @@ function collectInteractiveRects() {
 }
 
 export const WhaleStage = forwardRef<WhaleControllerHandle, WhaleStageProps>(function WhaleStage(
-  { settings, subagents = [], onAnchorMove, onDiag },
+  { settings, subagents = [], hudScale, hudGap, onAnchorMove, onDiag },
   ref
 ) {
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -733,7 +737,7 @@ export const WhaleStage = forwardRef<WhaleControllerHandle, WhaleStageProps>(fun
   };
 
   const stageWidth = stageRef.current?.clientWidth || window.innerWidth || 1920;
-  const hudPositions = resolveHudLayout(renderSubs, subAnchors, stageWidth);
+  const hudPositions = resolveHudLayout(renderSubs, subAnchors, stageWidth, hudScale, hudGap);
 
   return (
     <div

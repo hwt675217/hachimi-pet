@@ -1723,6 +1723,49 @@ body,
   animation: popIn 0.18s ease-out;
 }
 
+.hud-settings-panel {
+  left: 22px;
+  right: auto;
+  width: min(300px, calc(100vw - 44px));
+  overflow: auto;
+}
+
+.hud-settings-panel .stats-title {
+  margin: 0;
+}
+
+.hud-settings-controls {
+  display: grid;
+  gap: 12px;
+  padding: 12px 14px;
+  font-size: 12px;
+}
+
+.hud-settings-controls label {
+  display: grid;
+  gap: 5px;
+}
+
+.hud-settings-controls label > span {
+  display: flex;
+  justify-content: space-between;
+}
+
+.hud-settings-controls input {
+  margin: 0;
+}
+
+.hud-settings-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.hud-settings-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .stats-header {
   display: flex;
   align-items: center;

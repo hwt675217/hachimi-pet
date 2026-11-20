@@ -174,6 +174,10 @@ function rebuildTrayMenu() {
       })),
     },
     {
+      label: '头顶文字设置…',
+      click: () => sendRendererCommand({ type: 'openHudSettings' }),
+    },
+    {
       label: '👻 桌宠透明度',
       submenu: [1, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4].map((opacity) => ({
         label: opacity >= 0.999 ? '100% (不透明)' : `${Math.round(opacity * 100)}%`,

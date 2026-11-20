@@ -723,6 +723,10 @@ namespace HachimiPetShell
             }
             _trayMenu.Items.Add(sizeMenu);
 
+            var hudSettingsItem = new ToolStripMenuItem("头顶文字设置…");
+            hudSettingsItem.Click += delegate { SendCommandToWeb("openHudSettings"); };
+            _trayMenu.Items.Add(hudSettingsItem);
+
             var opacityMenu = new ToolStripMenuItem("👻 桌宠透明度");
             double[] opacityValues = new double[] { 1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4 };
             foreach (double opacityValue in opacityValues)

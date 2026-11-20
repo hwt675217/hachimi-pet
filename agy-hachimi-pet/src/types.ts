@@ -15,6 +15,8 @@ export interface PetSettings {
   autoSchemeByModel: boolean;
   roam: 'free' | 'off';
   scale: number;
+  hudScale: number;
+  hudGap: number;
   opacity: number;
   soundOn: boolean;
   safetyGateEnabled: boolean;

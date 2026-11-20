@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { PetExecutionStatus, QuotaBucket, QuotaSummary, SessionTelemetry } from '../types';
 
 interface StatusBubbleProps {
@@ -12,6 +12,8 @@ interface StatusBubbleProps {
   onClickBadge?: () => void;
   onOpenStats?: () => void;
   opacity?: number;
+  hudScale: number;
+  hudGap: number;
 }
 
 const STATUS_DOT_CLASS: Record<PetExecutionStatus, string> = {
@@ -81,8 +83,22 @@ export const StatusBubble: React.FC<StatusBubbleProps> = ({
   onClickBadge,
   onOpenStats,
   opacity = 1,
+  hudScale,
+  hudGap,
 }) => {
   const [typedSpeech, setTypedSpeech] = useState('');
+  const bubbleRef = useRef<HTMLDivElement>(null);
+  const [bubbleSize, setBubbleSize] = useState({ width: 0, height: 0 });
+
+  useLayoutEffect(() => {
+    const bubble = bubbleRef.current;
+    if (!bubble) return;
+    const measure = () => setBubbleSize({ width: bubble.offsetWidth, height: bubble.offsetHeight });
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(bubble);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (!speechText) {
@@ -108,8 +124,9 @@ export const StatusBubble: React.FC<StatusBubbleProps> = ({
     };
   }, [speechText]);
 
-  const clampedX = Math.max(160, Math.min(window.innerWidth - 160, anchor.x || window.innerWidth - 150));
-  const clampedY = Math.max(56, Math.min(window.innerHeight - 130, (anchor.y || window.innerHeight - 230) - 10));
+  const edgeX = Math.min(window.innerWidth / 2, bubbleSize.width * hudScale / 2 + 4);
+  const clampedX = Math.max(edgeX, Math.min(window.innerWidth - edgeX, anchor.x));
+  const clampedY = Math.min(window.innerHeight, Math.max(bubbleSize.height * hudScale + 4, anchor.y - hudGap));
 
   const showThinking = (status === 'THINKING' || status === 'READING' || status === 'CODING') && !!thinkingText;
 
@@ -143,6 +160,7 @@ export const StatusBubble: React.FC<StatusBubbleProps> = ({
 
   return (
     <div
+      ref={bubbleRef}
       className="status-bubble-wrap dynamic-head-wrap"
       style={{ left: `${clampedX}px`, top: `${clampedY}px`, opacity }}
     >
