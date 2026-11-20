@@ -69,10 +69,14 @@ export const App: React.FC = () => {
   }, []);
 
   const bridgePort = window.petHost?.bridgePort || 17890;
+  const petUiScale = Math.min(1, Math.max(0.5, snapshot.settings.scale ?? 1));
 
   return (
     <ErrorBoundary name="root" bridgePort={bridgePort} autoRecoverMs={1200}>
-      <div className="desktop-overlay-root">
+      <div
+        className="desktop-overlay-root"
+        style={{ '--pet-ui-scale': String(petUiScale) } as React.CSSProperties}
+      >
         <ErrorBoundary name="whale-stage" bridgePort={bridgePort} autoRecoverMs={1500}>
           <WhaleStage
             ref={whaleRef}
