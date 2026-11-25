@@ -46,6 +46,13 @@ function isNativeCliSession(cid, transcriptPath = '') {
 
 const RISKY_CMD_REGEX = /\b(rm\s+-rf|Remove-Item\b.*-Recurse|del\s+\/[fsq]|git\s+push\b.*--force|git\s+reset\s+--hard|format\s+[a-z]:|drop\s+(table|database)|shutdown\b|Restart-Computer)\b/i;
 
+function mergeSettings(settings, patch) {
+  const merged = { ...settings, ...patch };
+  merged.hudScale = Number.isFinite(merged.hudScale) ? Math.min(1.5, Math.max(0.6, merged.hudScale)) : settings.hudScale;
+  merged.hudGap = Number.isFinite(merged.hudGap) ? Math.min(64, Math.max(0, merged.hudGap)) : settings.hudGap;
+  return merged;
+}
+
 function loadSettings() {
   const initialProjects = Array.from(new Set([PARENT_WORKSPACE, PROJECT_ROOT]));
   const LEGACY_MAP = {
@@ -66,6 +73,9 @@ function loadSettings() {
     autoSchemeByModel: false,   // Auto-switch color scheme based on modelName
     roam: 'free',               // 'free' | 'off' (pinned corner)
     scale: 0.95,
+    hudScale: 1,
+    hudGap: 6,
+    opacity: 1.0,
     soundOn: true,
     safetyGateEnabled: false,   // Toggle PreToolUse hook on run_command
     interceptRiskyOnly: true,   // Pop Allow/Deny bubble on risky run_command
@@ -89,7 +99,7 @@ function loadSettings() {
       const rawScheme = String(saved.scheme || 'astral').toLowerCase();
       saved.scheme = VALID.has(rawScheme) ? rawScheme : (LEGACY_MAP[rawScheme] || 'astral');
       saved.outfit = 'maid';
-      return { ...defaults, ...saved };
+      return mergeSettings(defaults, saved);
     }
   } catch { /* ignore */ }
   return defaults;
@@ -430,7 +440,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
 
       if (url.pathname === '/api/settings') {
         if (body && typeof body === 'object') {
-          settings = { ...settings, ...body };
+          settings = mergeSettings(settings, body);
           saveSettings(settings);
           if (body.scheme || body.outfit) {
             broadcast('pet:scheme', { scheme: settings.scheme, outfit: settings.outfit });
@@ -1581,7 +1591,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
           broadcast('state:sync', snapshotState());
         }
       } else if (type === 'ui:update_settings') {
-        settings = { ...settings, ...payload };
+        settings = mergeSettings(settings, payload);
         saveSettings(settings);
         broadcast('state:sync', snapshotState());
       } else if (type === 'ui:test_spawn_subagent') {
@@ -1797,7 +1807,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
     pushRendererLog: (entry) => { rendererLogs.push(entry); if (rendererLogs.length > 50) rendererLogs.shift(); },
     getSettings: () => settings,
     updateSettings: (patch) => {
-      settings = { ...settings, ...patch };
+      settings = mergeSettings(settings, patch);
       saveSettings(settings);
       if (patch.scheme || patch.outfit) {
         broadcast('pet:scheme', { scheme: settings.scheme, outfit: settings.outfit });
