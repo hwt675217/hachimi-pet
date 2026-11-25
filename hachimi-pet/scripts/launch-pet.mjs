@@ -9,19 +9,22 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync, spawn } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 const APP_DIR = path.join(PLUGIN_ROOT, 'app');
-const PORT = Number(process.env.HACHIMI_PET_PORT || process.env.AGY_WHALE_PORT || 17890);
 const RUNTIME_DIR = path.join(os.homedir(), '.hachimi-pet', 'runtime');
-const FOREGROUND = process.argv.includes('--foreground');
+
+function getPort() {
+  return Number(process.env.HACHIMI_PET_PORT || process.env.AGY_WHALE_PORT || 17890);
+}
 
 function checkHealth(timeoutMs = 1200) {
+  const port = getPort();
   return new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${PORT}/health`, (res) => {
+    const req = http.get(`http://127.0.0.1:${port}/health`, (res) => {
       let data = '';
       res.on('data', (c) => { data += c; });
       res.on('end', () => {
@@ -117,13 +120,72 @@ function bootstrapElectronRuntime() {
   return bin;
 }
 
-export async function launchPet() {
+function isCurrentExecPathElectron() {
+  return Boolean(
+    process.versions?.electron ||
+    !/^node(\.exe)?$/i.test(path.basename(process.execPath))
+  );
+}
+
+function findStandaloneNodeBinary() {
+  if (process.platform !== 'win32') return '';
+  try {
+    const out = execFileSync('where', ['node'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    }).trim();
+    const candidates = out.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    for (const cand of candidates) {
+      // Only accept a real node.exe binary (skip .cmd/.bat/.ps1 shims such as agy-node.cmd)
+      if (!/^node\.exe$/i.test(path.basename(cand))) continue;
+      if (cand.toLowerCase() === process.execPath.toLowerCase()) continue;
+      if (!fs.existsSync(cand)) continue;
+      try {
+        const ver = execFileSync(
+          cand,
+          ['-p', 'process.versions.electron ? "" : process.versions.node'],
+          {
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore'],
+            windowsHide: true,
+            timeout: 2000,
+            env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+          }
+        ).trim();
+        const major = Number(ver.split('.')[0]);
+        if (Number.isFinite(major) && major >= 18) {
+          return cand;
+        }
+      } catch { /* try next candidate */ }
+    }
+  } catch { /* ignore */ }
+  return '';
+}
+
+function buildChildEnv({ needsElectronRunAsNode }) {
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === 'electron_run_as_node') {
+      delete env[key];
+    }
+  }
+  if (needsElectronRunAsNode) {
+    env.ELECTRON_RUN_AS_NODE = '1';
+  }
+  return env;
+}
+
+export async function launchPet(options = {}) {
+  const port = getPort();
+  const foreground = options.foreground ?? process.argv.includes('--foreground');
+
   if (!fs.existsSync(path.join(APP_DIR, 'electron', 'main.cjs'))) {
     throw new Error(`Missing app payload at ${APP_DIR}`);
   }
 
   if (await checkHealth()) {
-    console.log(JSON.stringify({ ok: true, alreadyRunning: true, port: PORT }));
+    console.log(JSON.stringify({ ok: true, alreadyRunning: true, port }));
     return 0;
   }
 
@@ -140,9 +202,20 @@ export async function launchPet() {
   let runtimeBin = '';
   let runtimeArgs = [];
   let runtimeCwd = APP_DIR;
+  let needsElectronRunAsNode = false;
 
   if (useWebView2) {
-    runtimeBin = process.execPath;
+    if (isCurrentExecPathElectron()) {
+      const standaloneNode = findStandaloneNodeBinary();
+      if (standaloneNode) {
+        runtimeBin = standaloneNode;
+      } else {
+        runtimeBin = process.execPath;
+        needsElectronRunAsNode = true;
+      }
+    } else {
+      runtimeBin = process.execPath;
+    }
     runtimeArgs = [wv2HostScript];
   } else {
     runtimeBin = findElectronBinary();
@@ -152,29 +225,59 @@ export async function launchPet() {
     runtimeArgs = [APP_DIR, '--sidecar'];
   }
 
-  if (FOREGROUND) {
+  const childEnv = buildChildEnv({ needsElectronRunAsNode: useWebView2 && needsElectronRunAsNode });
+
+  if (foreground) {
     return await new Promise((resolve) => {
+      let settled = false;
       const child = spawn(runtimeBin, runtimeArgs, {
         cwd: runtimeCwd,
+        env: childEnv,
         stdio: 'inherit',
         windowsHide: useWebView2,
       });
-      child.on('exit', (code) => resolve(code ?? 0));
-      child.on('error', () => resolve(1));
+      const forwardSignal = (sig) => {
+        try {
+          if (!child.killed) child.kill(sig);
+        } catch { /* ignore */ }
+      };
+      const onSigInt = () => forwardSignal('SIGINT');
+      const onSigTerm = () => forwardSignal('SIGTERM');
+      process.on('SIGINT', onSigInt);
+      process.on('SIGTERM', onSigTerm);
+
+      const finish = (code) => {
+        if (settled) return;
+        settled = true;
+        process.off('SIGINT', onSigInt);
+        process.off('SIGTERM', onSigTerm);
+        resolve(code);
+      };
+      child.on('exit', (code) => finish(code ?? 0));
+      child.on('error', () => finish(1));
     });
   }
 
   let pid = null;
   if (process.platform === 'win32') {
     // On Windows, `Win32_Process.Create` escapes sandboxing Job Objects so `/hachimi` persists cleanly!
+    // Pass the caller's environment explicitly via `Win32_ProcessStartup.EnvironmentVariables`
+    // because WMI-spawned processes do not inherit caller env vars (such as `ELECTRON_RUN_AS_NODE=1`).
     try {
       const esc = (s) => String(s).replace(/'/g, "''");
       const argStr = runtimeArgs.map((a) => `"${esc(a)}"`).join(' ');
-      const psCmd = useWebView2
-        ? `$sp = New-CimInstance -ClassName Win32_ProcessStartup -Property @{ ShowWindow = [uint16]0 } -ClientOnly; Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '"${esc(runtimeBin)}" ${argStr}'; CurrentDirectory = '${esc(runtimeCwd)}'; ProcessStartupInformation = $sp } | Select-Object -ExpandProperty ProcessId`
-        : `Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '"${esc(runtimeBin)}" ${argStr}'; CurrentDirectory = '${esc(runtimeCwd)}' } | Select-Object -ExpandProperty ProcessId`;
+      const spProps = useWebView2
+        ? '@{ ShowWindow = [uint16]0; EnvironmentVariables = $envVars }'
+        : '@{ EnvironmentVariables = $envVars }';
+      const psCmd = [
+        `$envVars = [string[]]@(Get-ChildItem Env: | Where-Object { $_.Name -and -not $_.Name.StartsWith('=') } | ForEach-Object { "$($_.Name)=$($_.Value)" })`,
+        `$sp = New-CimInstance -ClassName Win32_ProcessStartup -Property ${spProps} -ClientOnly`,
+        `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '"${esc(runtimeBin)}" ${argStr}'; CurrentDirectory = '${esc(runtimeCwd)}'; ProcessStartupInformation = $sp }`,
+        `if ($r.ReturnValue -eq 0) { $r.ProcessId }`,
+      ].join('; ');
       const out = execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psCmd], {
         encoding: 'utf8',
+        env: childEnv,
         windowsHide: true,
       }).trim();
       pid = Number(out) || null;
@@ -184,6 +287,7 @@ export async function launchPet() {
   if (!pid) {
     const child = spawn(runtimeBin, runtimeArgs, {
       cwd: runtimeCwd,
+      env: childEnv,
       detached: true,
       stdio: 'ignore',
       windowsHide: useWebView2,
@@ -195,7 +299,7 @@ export async function launchPet() {
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 300));
     if (await checkHealth(600)) {
-      console.log(JSON.stringify({ ok: true, launched: true, runtime: useWebView2 ? 'webview2' : 'electron', pid, port: PORT }));
+      console.log(JSON.stringify({ ok: true, launched: true, runtime: useWebView2 ? 'webview2' : 'electron', pid, port }));
       return 0;
     }
   }
@@ -204,7 +308,10 @@ export async function launchPet() {
   return 1;
 }
 
-if (import.meta.url === `file:///${process.argv[1].replace(/\\/g, '/')}` || process.argv[1]?.endsWith('launch-pet.mjs')) {
+if (
+  process.argv[1] &&
+  (import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href || process.argv[1].endsWith('launch-pet.mjs'))
+) {
   const code = await launchPet();
   process.exit(code);
 }
