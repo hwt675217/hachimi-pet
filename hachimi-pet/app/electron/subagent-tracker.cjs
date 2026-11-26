@@ -229,6 +229,11 @@ function inspectTranscriptActivity(transcriptPath, teamworkDir = '') {
           wokeSinceLastPlanner = true;
         } else if (t === 'PLANNER_RESPONSE') {
           serverRestarted = false;
+          const st = String(obj.status || '').toUpperCase();
+          if (st === 'ERROR') {
+            // Transient planner stream/model error before automatic retry — do not treat as finished turn.
+            continue;
+          }
           lastPlanner = obj;
           wokeSinceLastPlanner = false;
           const calls = Array.isArray(obj.tool_calls) ? obj.tool_calls : [];
@@ -279,10 +284,29 @@ function inspectTranscriptActivity(transcriptPath, teamworkDir = '') {
 }
 
 /**
- * Inspect `board.jsonl` to check if coordinator already posted `[done]` and get latest post per agent.
+ * Determine whether a Swarm coordinator's board post is a genuine Swarm-wide completion announcement
+ * (starts with `[done]` or `@all [done]`), as opposed to a task brief / follow-up mentioning `` `@coordinator [done]` ``.
+ */
+function isCoordinatorDonePost(rawText) {
+  const t = String(rawText || '').trim();
+  if (!t) return false;
+  return /^(?:@all\s+)?(?:\*\*)?\[done\](?:\*\*)?(?:\s|$|[:：,，.。!！\-—])/i.test(t);
+}
+
+/**
+ * Inspect `board.jsonl` to check if coordinator's latest wave ended with `[done]` and get latest post per agent.
  */
 function inspectSwarmBoard(boardPath) {
-  const result = { isDone: false, hasWorkerPost: false, mtimeMs: 0, latestByAgent: new Map() };
+  const result = {
+    isDone: false,
+    doneSeq: 0,
+    lastPostSeq: 0,
+    lastCoordTaskSeq: 0,
+    lastWorkerPostSeq: 0,
+    hasWorkerPost: false,
+    mtimeMs: 0,
+    latestByAgent: new Map(),
+  };
   try {
     if (!boardPath || !fs.existsSync(boardPath)) return result;
     const stat = fs.statSync(boardPath);
@@ -300,13 +324,22 @@ function inspectSwarmBoard(boardPath) {
       try {
         const post = JSON.parse(line);
         const agent = String(post.agent || post.sender || '').trim();
-        const text = String(post.text || '').replace(/\s+/g, ' ').trim();
+        const rawText = String(post.text || '');
+        const text = rawText.replace(/\s+/g, ' ').trim();
         if (!agent) continue;
-        result.latestByAgent.set(agent, { seq: post.seq, text });
+        const seq = Number(post.seq || 0);
+        if (seq > result.lastPostSeq) result.lastPostSeq = seq;
+        result.latestByAgent.set(agent, { seq, text });
         if (agent !== 'coordinator') {
           result.hasWorkerPost = true;
-        } else if (/\[done\]/i.test(text)) {
+          if (seq > result.lastWorkerPostSeq) result.lastWorkerPostSeq = seq;
+        } else if (isCoordinatorDonePost(rawText)) {
           result.isDone = true;
+          result.doneSeq = seq;
+        } else {
+          // Coordinator posted a new brief / follow-up task (starts or resumes a wave after any earlier [done])
+          result.isDone = false;
+          if (seq > result.lastCoordTaskSeq) result.lastCoordTaskSeq = seq;
         }
       } catch { /* ignore */ }
     }
@@ -348,8 +381,8 @@ class SubagentTracker {
     this.childConversations = new Set();
     /** @type {Set<string>} Permanently killed subagents & swarm keys */
     this.retiredKeys = new Set();
-    /** @type {Set<string>} Coordinator conversationIds whose Swarm posted `[done]` or finished */
-    this.closedSwarms = new Set();
+    /** @type {Map<string, { doneSeq: number, closedAt: number }>} Coordinator conversationIds whose latest Swarm wave posted `[done]` or finished */
+    this.closedSwarms = new Map();
 
     this.seq = 1;
     this.pollTimer = setInterval(() => this._pollSwarmAndTeamworkFiles(), 1200);
@@ -358,6 +391,24 @@ class SubagentTracker {
 
   isChildConversation(cid) {
     return this.childConversations.has(cid);
+  }
+
+  hasActiveForParent(parentConversationId) {
+    if (!parentConversationId) return false;
+    for (const it of this.items.values()) {
+      if (it.source === 'test') continue;
+      if (
+        it.parentConversationId === parentConversationId ||
+        this._isDescendantOf(it.parentConversationId, parentConversationId)
+      ) {
+        return true;
+      }
+    }
+    const pendingList = this.pendingByParent.get(parentConversationId);
+    if (pendingList && pendingList.some((p) => typeof p === 'string' && !p.startsWith('{') && this.items.has(p))) {
+      return true;
+    }
+    return false;
   }
 
   getPublicList() {
@@ -500,7 +551,9 @@ class SubagentTracker {
   }
 
   /**
-   * Retire any active subagent / Swarm catgirls belonging to a parent session that was canceled or became idle.
+   * Retire non-Swarm subagent catgirls belonging to a parent session that was explicitly canceled.
+   * Swarm workers are only retired if they are no longer actively running on disk, because canceling
+   * a coordinator turn in Antigravity does not kill running Swarm workers.
    */
   handleParentCanceled(parentConversationId) {
     if (!parentConversationId) return;
@@ -508,6 +561,14 @@ class SubagentTracker {
     for (const it of Array.from(this.items.values())) {
       if (it.source === 'test') continue;
       if (it.parentConversationId === parentConversationId || it.conversationId === parentConversationId) {
+        if (it.source === 'swarm') {
+          const diskWorking = this._isSwarmMemberWorkingOnDisk(it.parentConversationId, it.name, it.childConversationId);
+          if (diskWorking === true) continue;
+          // Do not permanently poison retiredKeys for un-killed Swarm workers; they can still wake up
+          this._finishAndRemove(it.id, { permanent: false, silent: true });
+          changed = true;
+          continue;
+        }
         this._finishAndRemove(it.id, { permanent: true, silent: true });
         changed = true;
       }
@@ -521,12 +582,16 @@ class SubagentTracker {
   }
 
   /**
-   * Called ONLY when a Swarm coordinator explicitly posts `[done]` (or explicit manual cleanup).
-   * Never called merely because a parent paused its dispatch turn while waiting for async children!
+   * Called ONLY when a Swarm coordinator explicitly posts a Swarm-wide `[done]` (or fallback completion).
+   * Does NOT permanently ban workers in `retiredKeys` so a multi-wave Swarm can resume cleanly on follow-up prompts!
    */
-  handleSwarmCompleted(coordinatorId) {
+  handleSwarmCompleted(coordinatorId, doneSeq = 0) {
     if (!coordinatorId) return;
-    this.closedSwarms.add(coordinatorId);
+    const prev = this.closedSwarms.get(coordinatorId);
+    this.closedSwarms.set(coordinatorId, {
+      doneSeq: Math.max(prev?.doneSeq || 0, Number(doneSeq) || 0),
+      closedAt: Date.now(),
+    });
 
     const toRemove = [];
     for (const it of this.items.values()) {
@@ -536,7 +601,7 @@ class SubagentTracker {
     }
     if (toRemove.length > 0) {
       for (const id of toRemove) {
-        this._finishAndRemove(id, { permanent: true, silent: true });
+        this._finishAndRemove(id, { permanent: false, silent: true });
       }
       this.onChange();
     }
@@ -677,9 +742,13 @@ class SubagentTracker {
       this.closedSwarms.delete(parentConversationId);
       this._handleSwarmToolCall(parentConversationId, args, { quiet: false });
     } else if (toolName === 'post_message') {
-      const text = String(args.text || '');
-      if (/\[done\]/i.test(text)) {
-        this.handleSwarmCompleted(parentConversationId);
+      if (!this.childConversations.has(parentConversationId)) {
+        const text = String(args.text || '');
+        if (isCoordinatorDonePost(text)) {
+          this.handleSwarmCompleted(parentConversationId);
+        } else {
+          this.closedSwarms.delete(parentConversationId);
+        }
       }
     }
   }
@@ -709,11 +778,15 @@ class SubagentTracker {
           this._handleSwarmToolCall(conversationId, ev.args, { quiet });
         }
       } else if (ev.toolName === 'post_message' && !quiet) {
-        const text = String(ev.args?.text || '');
-        // If coordinator posts `[done]`, immediately close & fade out all swarm workers!
-        if (!this.childConversations.has(conversationId) && /\[done\]/i.test(text)) {
-          this.handleSwarmCompleted(conversationId);
-          return;
+        if (!this.childConversations.has(conversationId)) {
+          const text = String(ev.args?.text || '');
+          // If coordinator posts a Swarm-wide `[done]`, immediately close & fade out all swarm workers!
+          if (isCoordinatorDonePost(text)) {
+            this.handleSwarmCompleted(conversationId);
+            return;
+          }
+          // Otherwise, a new coordinator board post opens/resumes the Swarm wave
+          this.closedSwarms.delete(conversationId);
         }
       }
     } else if (kind === 'subagent_created') {
@@ -847,6 +920,22 @@ class SubagentTracker {
       return;
     }
 
+    // Child transcript explicitly canceled
+    if (kind === 'canceled' && !quiet) {
+      if (item.source === 'swarm') {
+        const diskWorking = this._isSwarmMemberWorkingOnDisk(item.parentConversationId, item.name, conversationId);
+        if (diskWorking !== true && item.status !== 'WAITING') {
+          item.status = 'WAITING';
+          item.progressText = '💤 已暂停 · 等待唤醒…';
+          item.updatedAt = Date.now();
+          this.onChange();
+        }
+      } else if (!this._hasActiveDescendants(conversationId)) {
+        this._finishAndRemove(item.id);
+      }
+      return;
+    }
+
     // Subagent reached `assistant_reply` (`finalTurn`) or `turn_end`:
     // Swarm members transition to sleeping (`WAITING`) until the Swarm itself finishes; other subagents fade out when done!
     if ((kind === 'assistant_reply' && ev.finalTurn) || kind === 'turn_end') {
@@ -875,18 +964,20 @@ class SubagentTracker {
     const now = Date.now();
 
     const pendingList = this.pendingByParent.get(parentConversationId) || [];
-    if (origin === 'transcript') {
+    if (!quiet) {
+      // Symmetrically deduplicate hook vs transcript arrivals (whichever fires first!)
       for (const pid of pendingList) {
+        if (typeof pid !== 'string' || pid.startsWith('{')) continue;
         const existing = this.items.get(pid);
         if (
           existing &&
-          existing.spawnOrigin === 'hook' &&
-          !existing.matchedTranscript &&
+          existing.spawnOrigin !== origin &&
+          !existing.matchedOtherOrigin &&
           !existing.childConversationId &&
           existing.name === ident.name &&
-          now - existing.createdAt < 8000
+          now - existing.createdAt < 10000
         ) {
-          existing.matchedTranscript = true;
+          existing.matchedOtherOrigin = true;
           return existing;
         }
       }
@@ -903,7 +994,7 @@ class SubagentTracker {
     const item = {
       id,
       spawnOrigin: origin,
-      matchedTranscript: origin === 'transcript',
+      matchedOtherOrigin: false,
       parentConversationId,
       childConversationId: null,
       name: ident.name,
@@ -941,7 +1032,16 @@ class SubagentTracker {
     const resolvedPath = childTranscriptPath || findTranscriptPath(childConversationId);
 
     const pendingList = this.pendingByParent.get(parentConversationId) || [];
-    const head = pendingList.shift();
+    let head = null;
+    if (!quiet) {
+      // Drop stale historical deferred entries before binding a live subagent
+      while (pendingList.length > 0 && typeof pendingList[0] === 'string' && pendingList[0].startsWith('{')) {
+        pendingList.shift();
+      }
+      head = pendingList.shift();
+    } else {
+      head = pendingList.shift();
+    }
     if (pendingList.length === 0) {
       this.pendingByParent.delete(parentConversationId);
     }
@@ -1283,7 +1383,7 @@ class SubagentTracker {
     }
 
     for (const cid of candidateSwarmIds) {
-      if (!cid || this.closedSwarms.has(cid)) continue;
+      if (!cid) continue;
       for (const brainRoot of this.brainRoots) {
         const swarmDir = path.join(brainRoot, cid, '.system_generated', 'swarm');
         const membersPath = path.join(swarmDir, 'members.json');
@@ -1294,24 +1394,70 @@ class SubagentTracker {
           const hasTrackedFromThisSwarm = Array.from(this.items.values()).some((i) => i.parentConversationId === cid && i.source === 'swarm');
           if (!hasTrackedFromThisSwarm && now - stat.mtimeMs > 30 * 60 * 1000) continue;
 
-          // 1. Check `board.jsonl`: if coordinator posted `[done]`, close the entire Swarm immediately!
+          // 1. Check `board.jsonl`: only close when coordinator's latest wave ended with a Swarm-wide `[done]` post!
           const boardPath = path.join(swarmDir, 'board.jsonl');
           const boardInfo = inspectSwarmBoard(boardPath);
-          if (boardInfo.isDone) {
-            this.handleSwarmCompleted(cid);
-            continue;
-          }
 
           const data = JSON.parse(fs.readFileSync(membersPath, 'utf8'));
           const members = data?.members || {};
 
-          // 2. Fallback completion check (if coordinator finished final reply after worker posts without writing literal `[done]`):
-          // Only triggers when EVERY non-killed member (including coordinator) is resting (`wake_mode !== 'working'`),
-          // workers have already posted results on the board, and coordinator's transcript finished AFTER the last board post!
           const hasAnyWorkingMember = Object.values(members).some(
             (m) => m && !m.killed && String(m.phase || '').toUpperCase() === 'RUNNING' && m.wake_mode === 'working'
           );
-          if (!hasAnyWorkingMember && boardInfo.hasWorkerPost) {
+
+          // Handle multi-wave Swarms: if a previously closed Swarm starts a new wave (new coordinator post after doneSeq,
+          // or a worker actively wakes up after the close grace period), re-open it cleanly!
+          const closedInfo = this.closedSwarms.get(cid);
+          if (closedInfo) {
+            const hasNewerBoardActivity =
+              closedInfo.doneSeq > 0
+                ? (!boardInfo.isDone && boardInfo.lastCoordTaskSeq > closedInfo.doneSeq)
+                : (!boardInfo.isDone && boardInfo.mtimeMs > closedInfo.closedAt + 1000 && boardInfo.lastCoordTaskSeq > 0);
+            const hasActiveAfterClose =
+              hasAnyWorkingMember && !boardInfo.isDone && now - closedInfo.closedAt > 3000;
+            if (hasNewerBoardActivity || hasActiveAfterClose) {
+              this.closedSwarms.delete(cid);
+            } else {
+              if (boardInfo.isDone && boardInfo.doneSeq > (closedInfo.doneSeq || 0)) {
+                closedInfo.doneSeq = boardInfo.doneSeq;
+              }
+              continue;
+            }
+          }
+
+          if (boardInfo.isDone) {
+            this.handleSwarmCompleted(cid, boardInfo.doneSeq);
+            continue;
+          }
+
+          // Check whether any non-killed worker currently has a running background command/task on disk
+          let hasAnyWorkerBgTask = false;
+          const workerBgTasks = new Map();
+          for (const [memberName, m] of Object.entries(members)) {
+            if (memberName === 'coordinator' || !m || typeof m !== 'object' || m.killed) continue;
+            if (String(m.phase || '').toUpperCase() === 'KILLED') continue;
+            if (m.conversation_id) {
+              const wtp = path.join(brainRoot, m.conversation_id, '.system_generated', 'logs', 'transcript.jsonl');
+              if (fs.existsSync(wtp)) {
+                const wAct = inspectTranscriptActivity(wtp);
+                if (wAct.hasRunningBgTask) {
+                  hasAnyWorkerBgTask = true;
+                  workerBgTasks.set(memberName, true);
+                }
+              }
+            }
+          }
+
+          // 2. Fallback completion check (if coordinator finished final reply after worker posts without writing literal `[done]`):
+          // Only triggers when EVERY non-killed member is resting (`wake_mode !== 'working'` AND no running background tasks),
+          // workers have already posted results AFTER the coordinator's latest task assignment, and coordinator's transcript
+          // finished AFTER the last board post!
+          if (
+            !hasAnyWorkingMember &&
+            !hasAnyWorkerBgTask &&
+            boardInfo.hasWorkerPost &&
+            boardInfo.lastWorkerPostSeq > boardInfo.lastCoordTaskSeq
+          ) {
             const coordTranscript = path.join(brainRoot, cid, '.system_generated', 'logs', 'transcript.jsonl');
             const coordAct = inspectTranscriptActivity(coordTranscript);
             if (
@@ -1320,12 +1466,12 @@ class SubagentTracker {
               coordAct.mtimeMs > boardInfo.mtimeMs &&
               now - coordAct.mtimeMs > 8000
             ) {
-              this.handleSwarmCompleted(cid);
+              this.handleSwarmCompleted(cid, boardInfo.lastPostSeq);
               continue;
             }
           }
 
-          // 3. Sync each Swarm member: `wake_mode === 'working'` -> energetic WORKING; `wake_mode !== 'working'` -> cute SLEEPING (`WAITING`)!
+          // 3. Sync each Swarm member: `wake_mode === 'working'` (or running bg task) -> energetic WORKING; otherwise -> cute SLEEPING (`WAITING`)!
           for (const [memberName, m] of Object.entries(members)) {
             if (memberName === 'coordinator' || !m || typeof m !== 'object') continue;
             const swarmKey = `swarm:${cid}:${memberName}`;
@@ -1361,8 +1507,8 @@ class SubagentTracker {
             }
 
             const isWorkingOnHost =
-              String(m.phase || '').toUpperCase() === 'RUNNING' &&
-              m.wake_mode === 'working';
+              (String(m.phase || '').toUpperCase() === 'RUNNING' && m.wake_mode === 'working') ||
+              workerBgTasks.get(memberName) === true;
 
             const item =
               existing ||
@@ -1387,7 +1533,9 @@ class SubagentTracker {
             if (isWorkingOnHost) {
               if (item.status === 'WAITING') {
                 item.status = 'WORKING';
-                item.progressText = '🚀 已唤醒 · 正在执行任务…';
+                item.progressText = workerBgTasks.get(memberName)
+                  ? '⚡ 后台任务执行中…'
+                  : '🚀 已唤醒 · 正在执行任务…';
                 item.updatedAt = now;
                 dirty = true;
               }
@@ -1498,4 +1646,10 @@ class SubagentTracker {
   }
 }
 
-module.exports = { SubagentTracker, extractSubagentIdentity, inspectTranscriptActivity, inspectSwarmBoard };
+module.exports = {
+  SubagentTracker,
+  extractSubagentIdentity,
+  inspectTranscriptActivity,
+  inspectSwarmBoard,
+  isCoordinatorDonePost,
+};

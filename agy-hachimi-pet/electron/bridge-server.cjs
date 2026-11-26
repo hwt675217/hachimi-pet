@@ -747,7 +747,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       });
   }
 
-  function applySessionCanceled(s, { quiet = false, announce = true } = {}) {
+  function applySessionCanceled(s, { quiet = false, announce = true, cancelSubagents = true } = {}) {
     if (!s) return;
     s.status = 'AWAITING_NEXT';
     s.lastCancelAt = Date.now();
@@ -760,7 +760,9 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         try { appr.resolve({ decision: 'deny', reason: 'Canceled by user' }); } catch {}
       }
     }
-    subagentTracker?.handleParentCanceled?.(s.conversationId);
+    if (cancelSubagents) {
+      subagentTracker?.handleParentCanceled?.(s.conversationId);
+    }
     if (!quiet) {
       broadcast('pet:Reaction', {
         expression: announce ? 'surprised' : 'neutral',
@@ -1665,10 +1667,29 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
             ['THINKING', 'READING', 'CODING', 'RUNNING_CMD', 'WAITING_USER'].includes(existing.status);
           const lastBusyAt = Math.max(existing?.lastInvocationStartMs || 0, existing?.updatedAt || 0);
           if (isBusy && (c.updatedAt || 0) >= lastBusyAt - 200 && nowMs - lastBusyAt > 2500) {
-            applySessionCanceled(existing, {
-              quiet: c.conversationId !== activeConversationId,
-              announce: false,
-            });
+            if (subagentTracker?.hasActiveForParent?.(c.conversationId)) {
+              // Parent is legitimately parked in IDLE while waiting for async subagents / Swarm workers!
+              if (existing.status !== 'WAITING_USER') {
+                existing.status = 'AWAITING_NEXT';
+                existing.badge = '🐳 子代理协作执行中…';
+                if (c.conversationId === activeConversationId) {
+                  broadcast('pet:Reaction', {
+                    expression: 'neutral',
+                    motion: null,
+                    badge: existing.badge,
+                    thinking: false,
+                  });
+                  broadcast('state:sync', snapshotState());
+                }
+              }
+            } else {
+              // Passive SQLite IDLE reconciliation: never retire subagents without an explicit cancel signal
+              applySessionCanceled(existing, {
+                quiet: c.conversationId !== activeConversationId,
+                announce: false,
+                cancelSubagents: false,
+              });
+            }
           }
         }
       }
