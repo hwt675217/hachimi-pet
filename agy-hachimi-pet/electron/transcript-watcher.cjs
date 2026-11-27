@@ -379,16 +379,17 @@ class TranscriptWatcher extends EventEmitter {
       }
 
       const contentText = typeof step.content === 'string' ? step.content.trim() : '';
+      const isErrorStep = stepStatus === 'ERROR';
       if (contentText) {
         this.emit('step', {
           conversationId,
           kind: 'assistant_reply',
           text: contentText,
-          finalTurn: !hasTools,
+          finalTurn: !hasTools && !isErrorStep,
           createdAt,
           quiet: quietHistorical,
         });
-      } else if (!hasTools) {
+      } else if (!hasTools && !isErrorStep) {
         this.emit('step', {
           conversationId,
           kind: 'turn_end',
