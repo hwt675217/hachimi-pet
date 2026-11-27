@@ -1,5 +1,4 @@
 import { launchPet } from '../../scripts/launch-pet.mjs';
 
-process.argv.push('--foreground');
-const code = await launchPet();
+const code = await launchPet({ foreground: true });
 process.exit(code);
