@@ -357,14 +357,31 @@ class SubagentTracker {
    *   watcher: import('./transcript-watcher.cjs').TranscriptWatcher,
    *   getMainSettings: () => { scheme: string, outfit: string, defaultWorkspace?: string },
    *   getWatchedRootIds: () => string[],
+   *   getActiveConversationId?: () => string | null,
+   *   resolveCanonicalRootId?: (cid: string) => string | null,
+   *   getParentConversationId?: (cid: string) => string | null,
    *   onChange: () => void,
    *   onReaction: (ev: any) => void,
+   *   brainRoots?: string[],
    * }} deps
    */
-  constructor({ watcher, getMainSettings, getWatchedRootIds, onChange, onReaction, brainRoots }) {
+  constructor({
+    watcher,
+    getMainSettings,
+    getWatchedRootIds,
+    getActiveConversationId,
+    resolveCanonicalRootId,
+    getParentConversationId,
+    onChange,
+    onReaction,
+    brainRoots,
+  }) {
     this.watcher = watcher;
     this.getMainSettings = getMainSettings;
     this.getWatchedRootIds = getWatchedRootIds;
+    this.getActiveConversationId = getActiveConversationId;
+    this.resolveCanonicalRootId = resolveCanonicalRootId;
+    this.getParentConversationId = getParentConversationId;
     this.onChange = onChange;
     this.onReaction = onReaction;
     this.brainRoots = Array.isArray(brainRoots) ? brainRoots : BRAIN_ROOTS;
@@ -393,14 +410,53 @@ class SubagentTracker {
     return this.childConversations.has(cid);
   }
 
+  _canonicalize(cid) {
+    return cid ? (this.resolveCanonicalRootId?.(cid) || cid) : null;
+  }
+
+  _resolveRootConversationId(cid) {
+    if (!cid) return null;
+    let cur = this._canonicalize(cid);
+    const seen = new Set();
+    for (let hop = 0; hop < 10 && cur; hop++) {
+      if (seen.has(cur)) break;
+      seen.add(cur);
+      const vid = this.convToVisualId.get(cur);
+      const parent =
+        this.knownConvMeta.get(cur)?.parentConversationId ||
+        (vid ? this.items.get(vid)?.parentConversationId : null) ||
+        this.getParentConversationId?.(cur) ||
+        null;
+      const next = this._canonicalize(parent);
+      if (!next || next === cur || seen.has(next)) break;
+      cur = next;
+    }
+    return cur;
+  }
+
+  _belongsToRoot(itemOrParentCid, targetRootId) {
+    if (itemOrParentCid && typeof itemOrParentCid === 'object' && itemOrParentCid.source === 'test') {
+      return true;
+    }
+    if (!targetRootId) return false;
+    const cid =
+      typeof itemOrParentCid === 'string'
+        ? itemOrParentCid
+        : (itemOrParentCid?.parentConversationId || itemOrParentCid?.childConversationId || null);
+    if (!cid) return false;
+    return this._resolveRootConversationId(cid) === this._canonicalize(targetRootId);
+  }
+
+  _isActiveRoot(parentOrItem) {
+    const activeId = this.getActiveConversationId?.() || null;
+    return this._belongsToRoot(parentOrItem, activeId);
+  }
+
   hasActiveForParent(parentConversationId) {
     if (!parentConversationId) return false;
     for (const it of this.items.values()) {
       if (it.source === 'test') continue;
-      if (
-        it.parentConversationId === parentConversationId ||
-        this._isDescendantOf(it.parentConversationId, parentConversationId)
-      ) {
+      if (this._belongsToRoot(it, parentConversationId)) {
         return true;
       }
     }
@@ -411,14 +467,24 @@ class SubagentTracker {
     return false;
   }
 
-  getPublicList() {
+  getPublicList(activeConversationId) {
+    const targetRootId =
+      activeConversationId !== undefined
+        ? activeConversationId
+        : (this.getActiveConversationId?.() || null);
     return Array.from(this.items.values())
+      .filter((it) => this._belongsToRoot(it, targetRootId))
       .map((it) => ({
         id: it.id,
         name: it.name,
         role: it.role,
         typeName: it.typeName,
         source: it.source,
+        parentConversationId: it.parentConversationId || null,
+        rootConversationId:
+          it.source === 'test'
+            ? null
+            : this._resolveRootConversationId(it.parentConversationId || it.childConversationId),
         slotIndex: it.slotIndex,
         scheme: it.scheme,
         outfit: it.outfit,
@@ -431,12 +497,26 @@ class SubagentTracker {
       .sort((a, b) => a.createdAt - b.createdAt);
   }
 
-  clearAll() {
+  clearAll(activeConversationId = null) {
+    let activeAffected = false;
     for (const it of Array.from(this.items.values())) {
-      this._finishAndRemove(it.id, { permanent: true, silent: true });
+      if (!activeConversationId || this._belongsToRoot(it, activeConversationId)) {
+        if (this._isActiveRoot(it)) activeAffected = true;
+        this._finishAndRemove(it.id, { permanent: true, silent: true });
+      }
     }
-    this.pendingByParent.clear();
-    this.onChange();
+    if (activeConversationId) {
+      for (const parentCid of Array.from(this.pendingByParent.keys())) {
+        if (this._belongsToRoot(parentCid, activeConversationId)) {
+          this.pendingByParent.delete(parentCid);
+        }
+      }
+    } else {
+      this.pendingByParent.clear();
+    }
+    if (activeAffected) {
+      this.onChange();
+    }
   }
 
   removeById(id) {
@@ -454,6 +534,7 @@ class SubagentTracker {
   _finishAndRemove(id, { permanent = false, silent = false } = {}) {
     const it = this.items.get(id);
     if (!it) return;
+    const wasActiveVisible = this._isActiveRoot(it);
     if (it.retireTimer) {
       clearTimeout(it.retireTimer);
       it.retireTimer = null;
@@ -479,7 +560,7 @@ class SubagentTracker {
     }
 
     this.items.delete(id);
-    if (!silent) {
+    if (!silent && wasActiveVisible) {
       this.onChange();
     }
   }
@@ -537,7 +618,9 @@ class SubagentTracker {
         item.status = 'WAITING';
         item.progressText = '💤 休息待命中 · 等待唤醒…';
         item.updatedAt = Date.now();
-        this.onChange();
+        if (this._isActiveRoot(item)) {
+          this.onChange();
+        }
       }
       return;
     }
@@ -557,7 +640,7 @@ class SubagentTracker {
    */
   handleParentCanceled(parentConversationId) {
     if (!parentConversationId) return;
-    let changed = false;
+    let activeAffected = false;
     for (const it of Array.from(this.items.values())) {
       if (it.source === 'test') continue;
       if (it.parentConversationId === parentConversationId || it.conversationId === parentConversationId) {
@@ -565,18 +648,18 @@ class SubagentTracker {
           const diskWorking = this._isSwarmMemberWorkingOnDisk(it.parentConversationId, it.name, it.childConversationId);
           if (diskWorking === true) continue;
           // Do not permanently poison retiredKeys for un-killed Swarm workers; they can still wake up
+          if (this._isActiveRoot(it)) activeAffected = true;
           this._finishAndRemove(it.id, { permanent: false, silent: true });
-          changed = true;
           continue;
         }
+        if (this._isActiveRoot(it)) activeAffected = true;
         this._finishAndRemove(it.id, { permanent: true, silent: true });
-        changed = true;
       }
     }
     if (this.pendingByParent.has(parentConversationId)) {
       this.pendingByParent.delete(parentConversationId);
     }
-    if (changed) {
+    if (activeAffected) {
       this.onChange();
     }
   }
@@ -594,8 +677,10 @@ class SubagentTracker {
     });
 
     const toRemove = [];
+    let activeAffected = false;
     for (const it of this.items.values()) {
       if (it.source === 'swarm' && it.parentConversationId === coordinatorId) {
+        if (this._isActiveRoot(it)) activeAffected = true;
         toRemove.push(it.id);
       }
     }
@@ -603,7 +688,9 @@ class SubagentTracker {
       for (const id of toRemove) {
         this._finishAndRemove(id, { permanent: false, silent: true });
       }
-      this.onChange();
+      if (activeAffected) {
+        this.onChange();
+      }
     }
   }
 
@@ -612,19 +699,44 @@ class SubagentTracker {
   }
 
   _isDescendantOf(cid, ancestorId) {
+    if (!cid || !ancestorId) return false;
+    const canonicalAncestor = this._canonicalize(ancestorId);
     let cur = cid;
-    let guard = 0;
-    while (cur && guard++ < 8) {
-      if (cur === ancestorId) return true;
-      const meta = this.knownConvMeta.get(cur);
-      cur = meta?.parentConversationId || null;
+    const seen = new Set();
+    for (let hop = 0; hop < 10 && cur; hop++) {
+      if (cur === ancestorId || (canonicalAncestor && this._canonicalize(cur) === canonicalAncestor)) {
+        return true;
+      }
+      if (seen.has(cur)) break;
+      seen.add(cur);
+      const vid = this.convToVisualId.get(cur);
+      cur =
+        this.knownConvMeta.get(cur)?.parentConversationId ||
+        (vid ? this.items.get(vid)?.parentConversationId : null) ||
+        this.getParentConversationId?.(cur) ||
+        null;
     }
     return false;
   }
 
-  _allocateSlotIndex() {
+  _itemsInSameScope(parentCid) {
+    if (!parentCid) {
+      const activeId = this.getActiveConversationId?.() || null;
+      return Array.from(this.items.values()).filter((it) => this._belongsToRoot(it, activeId));
+    }
+    const targetRootId = this._resolveRootConversationId(parentCid);
+    const activeRootId = this._canonicalize(this.getActiveConversationId?.() || null);
+    const sameAsActive = Boolean(targetRootId && activeRootId && targetRootId === activeRootId);
+    return Array.from(this.items.values()).filter((it) => {
+      if (it.source === 'test') return sameAsActive;
+      if (!targetRootId) return it.parentConversationId === parentCid;
+      return this._resolveRootConversationId(it.parentConversationId || it.childConversationId) === targetRootId;
+    });
+  }
+
+  _allocateSlotIndex(parentCid = null) {
     const used = new Set();
-    for (const it of this.items.values()) {
+    for (const it of this._itemsInSameScope(parentCid)) {
       used.add(it.slotIndex);
     }
     let idx = 0;
@@ -632,12 +744,12 @@ class SubagentTracker {
     return idx;
   }
 
-  _allocateStyle(seed) {
+  _allocateStyle(seed, parentCid = null) {
     const main = this.getMainSettings?.() || { scheme: 'astral', outfit: 'maid' };
     const mainScheme = normalizeSchemeId(main.scheme);
     const usedCombos = new Set([`${mainScheme}-maid`]);
     const usedSchemes = new Set([mainScheme]);
-    for (const it of this.items.values()) {
+    for (const it of this._itemsInSameScope(parentCid)) {
       const sNorm = normalizeSchemeId(it.scheme);
       usedCombos.add(`${sNorm}-maid`);
       usedSchemes.add(sNorm);
@@ -687,14 +799,14 @@ class SubagentTracker {
     ];
     const tpl = templates[this.items.size % templates.length];
     const id = `whale_test_${Date.now()}_${this.seq++}`;
-    const style = this._allocateStyle(id + (payload.name || tpl.name));
+    const style = this._allocateStyle(id + (payload.name || tpl.name), null);
     const item = {
       id,
       name: payload.name || tpl.name,
       role: payload.role || tpl.role,
       typeName: 'test_subagent',
       source: 'test',
-      slotIndex: this._allocateSlotIndex(),
+      slotIndex: this._allocateSlotIndex(null),
       scheme: style.scheme,
       outfit: style.outfit,
       status: 'WORKING',
@@ -832,7 +944,7 @@ class SubagentTracker {
           }
         } else if (!this._isCoordinatorType(meta.typeName)) {
           const id = `whale_sub_${Date.now()}_${this.seq++}`;
-          const style = this._allocateStyle(`${meta.name}_${conversationId}`);
+          const style = this._allocateStyle(`${meta.name}_${conversationId}`, meta.parentConversationId);
           const revived = {
             id,
             parentConversationId: meta.parentConversationId,
@@ -844,7 +956,7 @@ class SubagentTracker {
             source: meta.source,
             teamworkFolder: meta.teamworkFolder,
             teamworkDir: meta.teamworkDir,
-            slotIndex: this._allocateSlotIndex(),
+            slotIndex: this._allocateSlotIndex(meta.parentConversationId),
             scheme: style.scheme,
             outfit: style.outfit,
             status: 'WORKING',
@@ -857,7 +969,9 @@ class SubagentTracker {
           this.items.set(id, revived);
           this.convToVisualId.set(conversationId, id);
           visualId = id;
-          this.onChange();
+          if (this._isActiveRoot(revived)) {
+            this.onChange();
+          }
         }
       }
     }
@@ -874,7 +988,7 @@ class SubagentTracker {
         item.progressPercent = Math.min(92, (item.progressPercent || 18) + 5);
       }
       item.updatedAt = Date.now();
-      if (!quiet) this.onChange();
+      if (!quiet && this._isActiveRoot(item)) this.onChange();
       return;
     }
 
@@ -888,7 +1002,7 @@ class SubagentTracker {
         item.status = 'WAITING';
         item.progressText = item.lastBoardSeq ? '💤 已汇报 · 睡眠待命中…' : '💤 休息待命中 · 等待唤醒…';
         item.updatedAt = Date.now();
-        if (!quiet) this.onChange();
+        if (!quiet && this._isActiveRoot(item)) this.onChange();
         return;
       }
 
@@ -916,7 +1030,7 @@ class SubagentTracker {
       }
 
       item.updatedAt = Date.now();
-      if (!quiet) this.onChange();
+      if (!quiet && this._isActiveRoot(item)) this.onChange();
       return;
     }
 
@@ -928,7 +1042,7 @@ class SubagentTracker {
           item.status = 'WAITING';
           item.progressText = '💤 已暂停 · 等待唤醒…';
           item.updatedAt = Date.now();
-          this.onChange();
+          if (this._isActiveRoot(item)) this.onChange();
         }
       } else if (!this._hasActiveDescendants(conversationId)) {
         this._finishAndRemove(item.id);
@@ -946,7 +1060,7 @@ class SubagentTracker {
             item.status = 'WAITING';
             item.progressText = item.lastBoardSeq ? '💤 已汇报 · 睡眠待命中…' : '💤 休息待命中 · 等待唤醒…';
             item.updatedAt = Date.now();
-            this.onChange();
+            if (this._isActiveRoot(item)) this.onChange();
           }
           return;
         }
@@ -990,7 +1104,7 @@ class SubagentTracker {
     }
 
     const id = `whale_sub_${now}_${this.seq++}`;
-    const style = this._allocateStyle(`${ident.name}_${id}`);
+    const style = this._allocateStyle(`${ident.name}_${id}`, parentConversationId);
     const item = {
       id,
       spawnOrigin: origin,
@@ -1003,7 +1117,7 @@ class SubagentTracker {
       source: ident.source,
       teamworkFolder: ident.teamworkFolder,
       teamworkDir: ident.teamworkDir,
-      slotIndex: this._allocateSlotIndex(),
+      slotIndex: this._allocateSlotIndex(parentConversationId),
       scheme: style.scheme,
       outfit: style.outfit,
       status: 'WORKING',
@@ -1018,12 +1132,14 @@ class SubagentTracker {
     pendingList.push(id);
     this.pendingByParent.set(parentConversationId, pendingList);
 
-    this.onReaction({
-      expression: 'love',
-      motion: 'wave',
-      speech: `🐳 子代理「${item.name}」天降支援啦！`,
-    });
-    this.onChange();
+    if (this._isActiveRoot(parentConversationId)) {
+      this.onReaction({
+        expression: 'love',
+        motion: 'wave',
+        speech: `🐳 子代理「${item.name}」天降支援啦！`,
+      });
+      this.onChange();
+    }
     return item;
   }
 
@@ -1105,7 +1221,7 @@ class SubagentTracker {
       };
       if (!(quiet && this._isCoordinatorType(ident.typeName))) {
         const id = `whale_sub_${Date.now()}_${this.seq++}`;
-        const style = this._allocateStyle(`${ident.name}_${childConversationId}`);
+        const style = this._allocateStyle(`${ident.name}_${childConversationId}`, parentConversationId);
         item = {
           id,
           parentConversationId,
@@ -1117,7 +1233,7 @@ class SubagentTracker {
           source: ident.source,
           teamworkFolder: ident.teamworkFolder,
           teamworkDir: ident.teamworkDir,
-          slotIndex: this._allocateSlotIndex(),
+          slotIndex: this._allocateSlotIndex(parentConversationId),
           scheme: style.scheme,
           outfit: style.outfit,
           status: 'WORKING',
@@ -1145,7 +1261,9 @@ class SubagentTracker {
         teamworkFolder: item.teamworkFolder || '',
         teamworkDir: item.teamworkDir || '',
       });
-      this.onChange();
+      if (this._isActiveRoot(item)) {
+        this.onChange();
+      }
     }
 
     if (resolvedPath) {
@@ -1173,7 +1291,7 @@ class SubagentTracker {
           Role: entry.role,
         });
         const id = `whale_sub_${Date.now()}_${this.seq++}`;
-        const style = this._allocateStyle(`${ident.name}_${cid}`);
+        const style = this._allocateStyle(`${ident.name}_${cid}`, parentConversationId);
         const item = {
           id,
           parentConversationId,
@@ -1183,7 +1301,7 @@ class SubagentTracker {
           role: ident.role,
           typeName: ident.typeName,
           source: ident.source,
-          slotIndex: this._allocateSlotIndex(),
+          slotIndex: this._allocateSlotIndex(parentConversationId),
           scheme: style.scheme,
           outfit: style.outfit,
           status: 'WORKING',
@@ -1194,7 +1312,9 @@ class SubagentTracker {
         };
         this.items.set(id, item);
         this.convToVisualId.set(cid, id);
-        this.onChange();
+        if (this._isActiveRoot(item)) {
+          this.onChange();
+        }
       }
       if (entry.transcriptPath) {
         this.childConversations.add(cid);
@@ -1269,7 +1389,12 @@ class SubagentTracker {
       const swarmKey = `swarm:${coordinatorId}:${baseName}`;
       this.retiredKeys.add(swarmKey);
       for (const it of Array.from(this.items.values())) {
-        if (it.swarmKey === swarmKey || (it.source === 'swarm' && it.name === baseName)) {
+        if (
+          it.swarmKey === swarmKey ||
+          (it.source === 'swarm' &&
+            it.parentConversationId === coordinatorId &&
+            (it.name === baseName || it.name.startsWith(baseName + '-')))
+        ) {
           this._finishAndRemove(it.id, { permanent: true });
         }
       }
@@ -1308,7 +1433,7 @@ class SubagentTracker {
 
     const tp = meta.transcriptPath || (meta.conversationId ? findTranscriptPath(meta.conversationId) : '');
     const id = `whale_swarm_${Date.now()}_${this.seq++}`;
-    const style = this._allocateStyle(swarmKey);
+    const style = this._allocateStyle(swarmKey, coordinatorId);
     const item = {
       id,
       swarmKey,
@@ -1319,7 +1444,7 @@ class SubagentTracker {
       role: `🐝 ${meta.role || 'Swarm Worker'}`,
       typeName: 'swarm_worker',
       source: 'swarm',
-      slotIndex: this._allocateSlotIndex(),
+      slotIndex: this._allocateSlotIndex(coordinatorId),
       scheme: style.scheme,
       outfit: style.outfit,
       status: 'WORKING',
@@ -1347,12 +1472,14 @@ class SubagentTracker {
       }
     }
 
-    this.onReaction({
-      expression: 'excited',
-      motion: 'jump',
-      speech: `🐝 蜂群成员「@${memberName}」空降就位！`,
-    });
-    this.onChange();
+    if (this._isActiveRoot(coordinatorId)) {
+      this.onReaction({
+        expression: 'excited',
+        motion: 'jump',
+        speech: `🐝 蜂群成员「@${memberName}」空降就位！`,
+      });
+      this.onChange();
+    }
     return item;
   }
 
@@ -1361,7 +1488,7 @@ class SubagentTracker {
    * and Teamwork (`progress.md`, `handoff.md`) sync!
    */
   _pollSwarmAndTeamworkFiles() {
-    let dirty = false;
+    let activeDirty = false;
     const now = Date.now();
 
     // A. Collect candidate root conversation IDs (watched roots + recently active Swarm folders in BRAIN_ROOTS)
@@ -1480,8 +1607,8 @@ class SubagentTracker {
             if (m.killed || String(m.phase || '').toUpperCase() === 'KILLED') {
               this.retiredKeys.add(swarmKey);
               if (existing) {
+                if (this._isActiveRoot(existing)) activeDirty = true;
                 this._finishAndRemove(existing.id, { permanent: true, silent: true });
-                dirty = true;
               }
               continue;
             }
@@ -1527,7 +1654,7 @@ class SubagentTracker {
               }
               item.progressPercent = Math.min(95, Math.max(item.progressPercent || 30, 88));
               item.updatedAt = now;
-              dirty = true;
+              if (this._isActiveRoot(item)) activeDirty = true;
             }
 
             if (isWorkingOnHost) {
@@ -1537,7 +1664,7 @@ class SubagentTracker {
                   ? '⚡ 后台任务执行中…'
                   : '🚀 已唤醒 · 正在执行任务…';
                 item.updatedAt = now;
-                dirty = true;
+                if (this._isActiveRoot(item)) activeDirty = true;
               }
             } else if (now - item.createdAt > 3000) {
               // Member is resting on the board (`mentions` / `anything`) -> enter sleeping state (`WAITING`)!
@@ -1550,7 +1677,7 @@ class SubagentTracker {
                   item.progressPercent = 20;
                 }
                 item.updatedAt = now;
-                dirty = true;
+                if (this._isActiveRoot(item)) activeDirty = true;
               }
             }
           }
@@ -1566,8 +1693,8 @@ class SubagentTracker {
 
       // 1. Reap unbound hook items that never materialized into a subagent within 45s
       if (!it.childConversationId && now - it.createdAt > 45000) {
+        if (this._isActiveRoot(it)) activeDirty = true;
         this._finishAndRemove(it.id, { silent: true });
-        dirty = true;
         continue;
       }
 
@@ -1576,13 +1703,13 @@ class SubagentTracker {
         if (!this._hasActiveDescendants(it.childConversationId)) {
           const act = inspectTranscriptActivity(it.transcriptPath, it.teamworkDir);
           if (!act.activelyWorking) {
+            if (this._isActiveRoot(it)) activeDirty = true;
             this._finishAndRemove(it.id, { silent: true });
-            dirty = true;
             continue;
           }
           if (now - Math.max(it.updatedAt, act.mtimeMs) > 20 * 60 * 1000) {
+            if (this._isActiveRoot(it)) activeDirty = true;
             this._finishAndRemove(it.id, { silent: true });
-            dirty = true;
             continue;
           }
         }
@@ -1601,8 +1728,8 @@ class SubagentTracker {
           if (!dir || !fs.existsSync(dir)) continue;
           const handoffPath = path.join(dir, 'handoff.md');
           if (fs.existsSync(handoffPath) && !this._hasActiveDescendants(it.childConversationId)) {
+            if (this._isActiveRoot(it)) activeDirty = true;
             this._finishAndRemove(it.id, { permanent: true, silent: true });
-            dirty = true;
             break;
           }
           const progressPath = path.join(dir, 'progress.md');
@@ -1617,12 +1744,12 @@ class SubagentTracker {
                 if (it.progressPercent !== pct) {
                   it.hasChecklistProgress = true;
                   it.progressPercent = pct;
-                  dirty = true;
+                  if (this._isActiveRoot(it)) activeDirty = true;
                 }
                 if (unchecked.length > 0 && !it.lastToolName) {
                   const currentStep = unchecked[0].replace(/^\s*-\s*\[\s\]\s*/, '').trim();
                   it.progressText = `📋 ${currentStep.slice(0, 36)}`;
-                  dirty = true;
+                  if (this._isActiveRoot(it)) activeDirty = true;
                 }
               }
             } catch { /* ignore */ }
@@ -1632,7 +1759,7 @@ class SubagentTracker {
       }
     }
 
-    if (dirty) {
+    if (activeDirty) {
       this.onChange();
     }
   }

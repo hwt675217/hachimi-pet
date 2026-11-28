@@ -260,7 +260,11 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
   let antigravityProjects = [];
   /** @type {Set<string>} Known subagent/swarm child conversation IDs */
   const knownChildIds = new Set();
+  /** @type {Map<string, string>} childConversationId -> parentConversationId */
+  const childParentMap = new Map();
+  const resolveCanonicalRootId = (cid) => (cid ? (linkedCliToOwner.get(cid) || cid) : null);
   let activeConversationId = null;
+  let activeViewTimeMs = 0;
   let quotaSummary = null;
   let quotaPending = false;
 
@@ -272,7 +276,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
 
   function isSubagentCid(cid, transcriptPath = '') {
     if (!cid) return false;
-    if (subagentTracker?.isChildConversation(cid) || knownChildIds.has(cid)) return true;
+    if (subagentTracker?.isChildConversation(cid) || knownChildIds.has(cid) || childParentMap.has(cid)) return true;
     const tp = transcriptPath || findTranscriptPath(cid);
     if (tp && isTranscriptLikelySubagent(tp)) {
       knownChildIds.add(cid);
@@ -413,14 +417,14 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
 
       if (url.pathname === '/api/subagents') {
         if (body.action === 'clear') {
-          subagentTracker?.clearAll();
-          sendJson(res, 200, { ok: true, subagents: [] });
+          subagentTracker?.clearAll(activeConversationId);
+          sendJson(res, 200, { ok: true, subagents: subagentTracker?.getPublicList(activeConversationId) || [] });
         } else if (body.action === 'remove' && body.id) {
           subagentTracker?.removeById(body.id);
-          sendJson(res, 200, { ok: true, subagents: subagentTracker?.getPublicList() || [] });
+          sendJson(res, 200, { ok: true, subagents: subagentTracker?.getPublicList(activeConversationId) || [] });
         } else {
           const item = subagentTracker?.spawnTestSubagent(body);
-          const list = subagentTracker?.getPublicList() || [];
+          const list = subagentTracker?.getPublicList(activeConversationId) || [];
           const pubItem = item ? list.find((x) => x.id === item.id) || null : null;
           sendJson(res, 200, { ok: true, item: pubItem, subagents: list });
         }
@@ -583,7 +587,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       queuedCounts: Object.fromEntries(
         Array.from(queuedMessages.entries()).map(([k, arr]) => [k, arr.length])
       ),
-      subagents: subagentTracker ? subagentTracker.getPublicList() : [],
+      subagents: subagentTracker ? subagentTracker.getPublicList(activeConversationId) : [],
       quota: quotaSummary,
     };
   }
@@ -630,6 +634,9 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       }
       return Array.from(ids);
     },
+    getActiveConversationId: () => activeConversationId,
+    resolveCanonicalRootId,
+    getParentConversationId: (cid) => childParentMap.get(cid) || null,
     onChange: () => {
       broadcast('state:sync', snapshotState());
     },
@@ -671,6 +678,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         lastAssistantReply: '',
         telemetry: resolvedTranscript ? readInitialTranscriptTelemetry(resolvedTranscript) : null,
         lastInvocationStartMs: 0,
+        viewTimeMs: catalogHit?.convo?.viewTimeMs || 0,
         messages: [],
         updatedAt: catalogHit?.convo?.updatedAt || Date.now(),
       };
@@ -678,6 +686,9 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       refreshSessionTelemetry(cid);
     } else {
       if (resolvedTranscript && cid === rawCid) s.transcriptPath = resolvedTranscript;
+      if (catalogHit?.convo?.viewTimeMs && catalogHit.convo.viewTimeMs > (s.viewTimeMs || 0)) {
+        s.viewTimeMs = catalogHit.convo.viewTimeMs;
+      }
       if (payload.modelName) s.modelName = payload.modelName;
       if (workspacePath) s.workspacePath = workspacePath;
       if (projectId) s.projectId = projectId;
@@ -786,8 +797,9 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
     return items;
   }
 
-  function dockToLatestSession(cid, opts = {}) {
-    if (!cid || isSubagentCid(cid, opts.transcriptPath)) return null;
+  function dockToLatestSession(rawCid, opts = {}) {
+    if (!rawCid || isSubagentCid(rawCid, opts.transcriptPath)) return null;
+    const cid = resolveCanonicalRootId(rawCid);
     const prevActive = activeConversationId;
     const catalogHit = findCatalogConversation(cid);
     const s = ensureSession({
@@ -807,6 +819,12 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
 
     if (opts.timestampMs && opts.timestampMs > (s.updatedAt || 0)) {
       s.updatedAt = opts.timestampMs;
+    }
+    if (opts.viewTimeMs && opts.viewTimeMs > (s.viewTimeMs || 0)) {
+      s.viewTimeMs = opts.viewTimeMs;
+    }
+    if (opts.viewTimeMs && opts.viewTimeMs > activeViewTimeMs) {
+      activeViewTimeMs = opts.viewTimeMs;
     }
 
     if (prevActive !== cid) {
@@ -857,7 +875,15 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       return {};
     }
 
-    const s = ensureSession(payload);
+    const isSessionStart = eventName === 'SessionStart';
+    const s = ensureSession({
+      ...payload,
+      preserveSelection: isSessionStart ? false : Boolean(activeConversationId),
+    });
+    if (isSessionStart) {
+      activeViewTimeMs = Math.max(activeViewTimeMs, Date.now());
+    }
+    const isActive = s.conversationId === activeConversationId;
 
     switch (eventName) {
       case 'SessionStart': {
@@ -878,13 +904,15 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         s.status = 'THINKING';
         s.lastInvocationStartMs = Date.now();
         s.badge = '💭 正在深度思考中…';
-        broadcast('pet:Reaction', {
-          expression: 'thinking',
-          motion: null,
-          badge: s.badge,
-          thinking: true,
-        });
-        broadcast('state:sync', snapshotState());
+        if (isActive) {
+          broadcast('pet:Reaction', {
+            expression: 'thinking',
+            motion: null,
+            badge: s.badge,
+            thinking: true,
+          });
+          broadcast('state:sync', snapshotState());
+        }
         return {};
       }
 
@@ -897,13 +925,15 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         s.status = pres.status;
         s.badge = pres.badge;
 
-        broadcast('pet:Reaction', {
-          expression: pres.expression,
-          motion: pres.motion,
-          badge: pres.badge,
-          thinking: pres.thinking,
-        });
-        broadcast('state:sync', snapshotState());
+        if (isActive) {
+          broadcast('pet:Reaction', {
+            expression: pres.expression,
+            motion: pres.motion,
+            badge: pres.badge,
+            thinking: pres.thinking,
+          });
+          broadcast('state:sync', snapshotState());
+        }
 
         // Check if this tool call should trigger interactive approval on the desktop pet
         if (toolName === 'run_command') {
@@ -922,14 +952,16 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
           const shortErr = String(payload.error).slice(0, 80);
           s.status = 'ERROR';
           s.badge = `💦 工具报错: ${shortErr}`;
-          broadcast('pet:Reaction', {
-            expression: 'flustered',
-            motion: 'shiver',
-            speech: `呜哇，刚才的命令报错了：${shortErr}`,
-            badge: s.badge,
-            thinking: false,
-          });
-          broadcast('state:sync', snapshotState());
+          if (isActive) {
+            broadcast('pet:Reaction', {
+              expression: 'flustered',
+              motion: 'shiver',
+              speech: `呜哇，刚才的命令报错了：${shortErr}`,
+              badge: s.badge,
+              thinking: false,
+            });
+            broadcast('state:sync', snapshotState());
+          }
         }
         return {};
       }
@@ -943,14 +975,16 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
           const combined = queued.map((m) => m.text).join('\n');
           s.messages.push({ role: 'user', text: combined, via: 'pet-queue', ts: Date.now() });
           s.badge = '📨 已注入桌宠排队指令！';
-          broadcast('pet:Reaction', {
-            expression: 'excited',
-            motion: 'nod',
-            speech: `收到补充指令，马上继续干活！`,
-            badge: s.badge,
-            thinking: true,
-          });
-          broadcast('state:sync', snapshotState());
+          if (isActive) {
+            broadcast('pet:Reaction', {
+              expression: 'excited',
+              motion: 'nod',
+              speech: `收到补充指令，马上继续干活！`,
+              badge: s.badge,
+              thinking: true,
+            });
+            broadcast('state:sync', snapshotState());
+          }
           return {
             injectSteps: [{ userMessage: combined }],
             terminationBehavior: 'force_continue',
@@ -965,14 +999,16 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
           const combined = queued.map((m) => m.text).join('\n');
           s.messages.push({ role: 'user', text: combined, via: 'pet-stop-hook', ts: Date.now() });
           s.badge = '🚀 接力执行桌宠下一条指令…';
-          broadcast('pet:Reaction', {
-            expression: 'excited',
-            motion: 'jump',
-            speech: '收到下一步命令，继续冲鸭！',
-            badge: s.badge,
-            thinking: true,
-          });
-          broadcast('state:sync', snapshotState());
+          if (isActive) {
+            broadcast('pet:Reaction', {
+              expression: 'excited',
+              motion: 'jump',
+              speech: '收到下一步命令，继续冲鸭！',
+              badge: s.badge,
+              thinking: true,
+            });
+            broadcast('state:sync', snapshotState());
+          }
           return {
             decision: 'continue',
             reason: `用户在桌宠下达了下一步指令，请立即按此继续执行：\n${combined}`,
@@ -990,30 +1026,36 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
               try { appr.resolve({ decision: 'deny', reason: 'Turn errored' }); } catch {}
             }
           }
-          broadcast('pet:Reaction', {
-            expression: 'cry',
-            motion: 'shiver',
-            speech: `任务遇到错误停下来了，要点「自动修复」让我接着看吗？`,
-            badge: s.badge,
-            thinking: false,
-          });
+          if (isActive) {
+            broadcast('pet:Reaction', {
+              expression: 'cry',
+              motion: 'shiver',
+              speech: `任务遇到错误停下来了，要点「自动修复」让我接着看吗？`,
+              badge: s.badge,
+              thinking: false,
+            });
+          }
         } else if (/CANCEL/i.test(reason)) {
-          applySessionCanceled(s, { quiet: false, announce: true });
+          applySessionCanceled(s, { quiet: !isActive, announce: isActive });
           refreshSessionTelemetry(s.conversationId);
           return { decision: 'stop' };
         } else {
           s.status = 'AWAITING_NEXT';
           s.badge = '🎉 本轮任务已完成';
-          broadcast('pet:Reaction', {
-            expression: 'happy',
-            motion: 'hop',
-            speech: '本轮任务搞定啦～',
-            badge: s.badge,
-            thinking: false,
-          });
+          if (isActive) {
+            broadcast('pet:Reaction', {
+              expression: 'happy',
+              motion: 'hop',
+              speech: '本轮任务搞定啦～',
+              badge: s.badge,
+              thinking: false,
+            });
+          }
         }
         refreshSessionTelemetry(s.conversationId);
-        broadcast('state:sync', snapshotState());
+        if (isActive) {
+          broadcast('state:sync', snapshotState());
+        }
         return { decision: 'stop' };
       }
 
@@ -1197,6 +1239,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
     ownerSession.status = 'THINKING';
     ownerSession.badge = '🚀 正在通过 agy 执行指令…';
     activeConversationId = ownerSession.conversationId;
+    activeViewTimeMs = Math.max(activeViewTimeMs, Date.now());
 
     runner.runTurn({
       prompt: effectivePrompt,
@@ -1221,20 +1264,43 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
   watcher.on('step', (ev) => {
     subagentTracker.handleTranscriptStep(ev);
 
-    if (subagentTracker.isChildConversation(ev.conversationId) || knownChildIds.has(ev.conversationId)) {
+    if (subagentTracker.isChildConversation(ev.conversationId) || knownChildIds.has(ev.conversationId) || childParentMap.has(ev.conversationId)) {
       return;
     }
+    const shouldDock = !ev.quiet && (ev.kind === 'user_input' || !activeConversationId);
     let s = sessions.get(ev.conversationId);
     if (!s && !ev.quiet && !isSubagentCid(ev.conversationId)) {
-      s = dockToLatestSession(ev.conversationId, { timestampMs: Date.now(), announceSwitch: true });
+      if (shouldDock) {
+        const nowMs = Date.now();
+        activeViewTimeMs = Math.max(activeViewTimeMs, nowMs);
+        s = dockToLatestSession(ev.conversationId, {
+          timestampMs: nowMs,
+          viewTimeMs: nowMs,
+          announceSwitch: Boolean(activeConversationId),
+        });
+      } else {
+        s = ensureSession({
+          conversationId: ev.conversationId,
+          preserveSelection: true,
+        });
+      }
     }
     if (!s) return;
     if (!ev.quiet) {
       s.updatedAt = Date.now();
-      if (activeConversationId !== ev.conversationId) {
-        dockToLatestSession(ev.conversationId, { timestampMs: Date.now(), announceSwitch: true });
+      if (shouldDock) {
+        const nowMs = Date.now();
+        activeViewTimeMs = Math.max(activeViewTimeMs, nowMs);
+        if (activeConversationId !== ev.conversationId) {
+          dockToLatestSession(ev.conversationId, {
+            timestampMs: nowMs,
+            viewTimeMs: nowMs,
+            announceSwitch: Boolean(activeConversationId),
+          });
+        }
       }
     }
+    const isActive = ev.conversationId === activeConversationId;
 
     if (ev.kind === 'compacted') {
       const prevLimit = s.telemetry?.contextLimit || (Number(ev.step?.input_tokens || 0) > 256000 ? 512000 : 256000);
@@ -1246,13 +1312,15 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       if (!ev.quiet) {
         s.badge = '🗜️ 上下文已压缩';
         refreshSessionTelemetry(ev.conversationId);
-        broadcast('pet:Reaction', {
-          expression: 'happy',
-          motion: 'nod',
-          badge: s.badge,
-          thinking: false,
-        });
-        broadcast('state:sync', snapshotState());
+        if (isActive) {
+          broadcast('pet:Reaction', {
+            expression: 'happy',
+            motion: 'nod',
+            badge: s.badge,
+            thinking: false,
+          });
+          broadcast('state:sync', snapshotState());
+        }
       }
       return;
     }
@@ -1262,14 +1330,16 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       if (!ev.quiet) {
         refreshSessionTelemetry(ev.conversationId);
         refreshQuotaSummary();
-        broadcast('state:sync', snapshotState());
+        if (isActive) {
+          broadcast('state:sync', snapshotState());
+        }
       }
       return;
     }
 
     if (ev.kind === 'thinking') {
       s.lastThinking = ev.text;
-      if (!ev.quiet) {
+      if (!ev.quiet && isActive) {
         broadcast('pet:thinking', { conversationId: ev.conversationId, text: ev.text });
       }
     } else if (ev.kind === 'assistant_reply') {
@@ -1285,7 +1355,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         s.messages.push({ role: 'assistant', text: ev.text, ts: Date.parse(ev.createdAt) || Date.now() });
         if (s.messages.length > 40) s.messages.shift();
       }
-      if (!ev.quiet) {
+      if (!ev.quiet && isActive) {
         broadcast('pet:assistant', { conversationId: ev.conversationId, text: ev.text });
         broadcast('state:sync', snapshotState());
       }
@@ -1306,14 +1376,15 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
             w.resolve({ nextInstruction: '', endCompanion: false, yieldedToMainWindow: true });
           }
         }
-        broadcast('state:sync', snapshotState());
+        if (isActive) {
+          broadcast('state:sync', snapshotState());
+        }
       }
     } else if (ev.kind === 'tool_call') {
       const pres = mapToolPresentation(ev.toolName, ev.args);
       s.status = pres.status;
       s.badge = pres.badge;
-      if (!ev.quiet) {
-        activeConversationId = ev.conversationId;
+      if (!ev.quiet && isActive) {
         broadcast('pet:Reaction', {
           expression: pres.expression,
           motion: pres.motion,
@@ -1323,13 +1394,13 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         broadcast('state:sync', snapshotState());
       }
     } else if (ev.kind === 'canceled') {
-      applySessionCanceled(s, { quiet: ev.quiet, announce: !ev.quiet });
+      applySessionCanceled(s, { quiet: ev.quiet || !isActive, announce: !ev.quiet && isActive });
     } else if (ev.kind === 'turn_end') {
       if (s.status !== 'IDLE' && s.status !== 'AWAITING_NEXT') {
         s.status = 'AWAITING_NEXT';
         const label = shortTitleLabel(s.title || s.projectName);
         s.badge = label ? `🎉 已结束 · ${label}` : '🎉 本轮已结束';
-        if (!ev.quiet) {
+        if (!ev.quiet && isActive) {
           broadcast('pet:Reaction', {
             expression: 'neutral',
             motion: null,
@@ -1344,7 +1415,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         s.lastCancelAt = Date.now();
         s.status = 'AWAITING_NEXT';
         s.badge = '⏸️ 对话流已中断';
-        if (!ev.quiet) {
+        if (!ev.quiet && isActive) {
           broadcast('pet:Reaction', {
             expression: 'surprised',
             motion: 'look',
@@ -1357,8 +1428,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
     } else if (ev.kind === 'ask_question') {
       s.status = 'WAITING_USER';
       s.badge = '❓ 主窗口正在向你提问确认！';
-      if (!ev.quiet) {
-        activeConversationId = ev.conversationId;
+      if (!ev.quiet && isActive) {
         broadcast('pet:Reaction', {
           expression: 'confused',
           motion: 'wave',
@@ -1484,6 +1554,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
     s.badge = `📂 已选中项目「${proj.name}」，请输入指令开启新对话`;
     s.status = 'IDLE';
     activeConversationId = newId;
+    activeViewTimeMs = Math.max(activeViewTimeMs, Date.now());
     return s;
   }
 
@@ -1549,6 +1620,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
               preserveTimestamp: true,
             });
             activeConversationId = topConvo.conversationId;
+            activeViewTimeMs = Math.max(activeViewTimeMs, Date.now());
           } else {
             startNewConversationUnderProject(proj);
           }
@@ -1568,6 +1640,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
           preserveTimestamp: true,
         });
         activeConversationId = cid;
+        activeViewTimeMs = Math.max(activeViewTimeMs, Date.now());
         if (sel?.projectId) {
           settings.selectedProjectId = sel.projectId;
         }
@@ -1599,7 +1672,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       } else if (type === 'ui:test_spawn_subagent') {
         subagentTracker.spawnTestSubagent(payload);
       } else if (type === 'ui:clear_subagents') {
-        subagentTracker.clearAll();
+        subagentTracker.clearAll(activeConversationId);
       } else if (type === 'ui:remove_subagent') {
         if (payload.id) {
           subagentTracker.removeById(payload.id);
@@ -1616,17 +1689,34 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       if (list?.childIds) {
         for (const cid of list.childIds) knownChildIds.add(cid);
       }
+      if (list?.childParentMap) {
+        for (const [childCid, parentCid] of list.childParentMap.entries()) {
+          if (childCid && parentCid) {
+            childParentMap.set(childCid, parentCid);
+          }
+        }
+      }
       if (!Array.isArray(list) || list.length === 0) return;
       antigravityProjects = list;
 
       const allConvos = [];
+      let bestViewedCid = null;
+      let bestViewTs = 0;
       for (const proj of list) {
         for (const c of proj.conversations || []) {
           allConvos.push(c);
+          if ((c.viewTimeMs || 0) > bestViewTs) {
+            bestViewTs = c.viewTimeMs || 0;
+            bestViewedCid = c.conversationId;
+          }
           const existing = sessions.get(c.conversationId);
           if (existing) {
             existing.projectId = proj.id;
             existing.projectName = proj.name;
+            existing.viewTimeMs = Math.max(existing.viewTimeMs || 0, c.viewTimeMs || 0);
+            if (c.conversationId === activeConversationId && (c.viewTimeMs || 0) > activeViewTimeMs) {
+              activeViewTimeMs = c.viewTimeMs;
+            }
             if (c.title && (!existing.title || existing.title === '新对话' || existing.title.startsWith('对话 '))) {
               existing.title = c.title;
               if ((existing.status === 'IDLE' || existing.status === 'AWAITING_NEXT') && activeConversationId === c.conversationId) {
@@ -1717,32 +1807,45 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
         } catch { /* ignore */ }
       }
 
-      // Pick the globally newest root session across both catalog and live sessions
-      let newestCid = allConvos[0]?.conversationId || null;
-      let newestTs = allConvos[0]?.updatedAt || 0;
-      for (const s of sessions.values()) {
-        if (s.conversationId.startsWith('proj-') || s.conversationId.startsWith('mini-') || isSubagentCid(s.conversationId, s.transcriptPath)) {
-          continue;
-        }
-        if ((s.updatedAt || 0) > newestTs) {
-          newestTs = s.updatedAt || 0;
-          newestCid = s.conversationId;
-        }
-      }
-
-      if (newestCid) {
-        const curActive = activeConversationId ? sessions.get(activeConversationId) : null;
-        const shouldSwitch =
-          !activeConversationId ||
-          !curActive ||
-          (newestCid !== activeConversationId && newestTs > (curActive.updatedAt || 0) + 500);
-
-        if (shouldSwitch) {
-          dockToLatestSession(newestCid, {
-            timestampMs: newestTs,
-            announceSwitch: Boolean(activeConversationId),
+      // Initial docking uses highest `last_user_view_time` (or newest `updatedAt` if no view time yet).
+      // Once `activeConversationId` is set, ONLY switch when another root conversation has a strictly newer `viewTimeMs`.
+      if (!activeConversationId) {
+        if (bestViewedCid && bestViewTs > 0) {
+          dockToLatestSession(bestViewedCid, {
+            timestampMs: bestViewTs,
+            viewTimeMs: bestViewTs,
+            announceSwitch: false,
           });
+        } else {
+          let newestCid = allConvos[0]?.conversationId || null;
+          let newestTs = allConvos[0]?.updatedAt || 0;
+          for (const s of sessions.values()) {
+            if (s.conversationId.startsWith('proj-') || s.conversationId.startsWith('mini-') || isSubagentCid(s.conversationId, s.transcriptPath)) {
+              continue;
+            }
+            if ((s.updatedAt || 0) > newestTs) {
+              newestTs = s.updatedAt || 0;
+              newestCid = s.conversationId;
+            }
+          }
+          if (newestCid) {
+            dockToLatestSession(newestCid, {
+              timestampMs: newestTs,
+              announceSwitch: false,
+            });
+          }
         }
+      } else if (
+        bestViewedCid &&
+        bestViewedCid !== activeConversationId &&
+        resolveCanonicalRootId(bestViewedCid) !== activeConversationId &&
+        bestViewTs > activeViewTimeMs + 200
+      ) {
+        dockToLatestSession(bestViewedCid, {
+          timestampMs: bestViewTs,
+          viewTimeMs: bestViewTs,
+          announceSwitch: true,
+        });
       }
 
       if (activeConversationId) {
@@ -1760,16 +1863,33 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
     if (fs.existsSync(ANNOTATIONS_DIR)) {
       annotationWatcher = fs.watch(ANNOTATIONS_DIR, { persistent: false }, (_ev, filename) => {
         if (!filename || !filename.endsWith('.pbtxt')) return;
-        const cid = filename.slice(0, -6);
+        const rawCid = filename.slice(0, -6);
         setTimeout(() => {
-          if (isSubagentCid(cid)) return;
-          const ann = readSingleAnnotation(cid);
+          if (isSubagentCid(rawCid)) return;
+          const ann = readSingleAnnotation(rawCid);
           if (!ann || !ann.viewTimeMs) return;
-          const curActive = activeConversationId ? sessions.get(activeConversationId) : null;
-          if (!activeConversationId || (cid !== activeConversationId && ann.viewTimeMs >= (curActive?.updatedAt || 0) - 500)) {
+          const cid = resolveCanonicalRootId(rawCid);
+          if (isSubagentCid(cid)) return;
+          if (cid === activeConversationId) {
+            activeViewTimeMs = Math.max(activeViewTimeMs, ann.viewTimeMs);
+            const curActive = sessions.get(cid);
+            if (curActive) {
+              curActive.viewTimeMs = Math.max(curActive.viewTimeMs || 0, ann.viewTimeMs);
+              if (ann.title && curActive.title !== ann.title) {
+                curActive.title = ann.title;
+                if (curActive.status === 'IDLE' || curActive.status === 'AWAITING_NEXT') {
+                  curActive.badge = `🐳 当前会话: ${shortTitleLabel(ann.title)}`;
+                }
+                broadcast('state:sync', snapshotState());
+              }
+            }
+            return;
+          }
+          if (!activeConversationId || ann.viewTimeMs >= activeViewTimeMs - 200) {
             const s = dockToLatestSession(cid, {
               title: ann.title,
               timestampMs: ann.viewTimeMs,
+              viewTimeMs: ann.viewTimeMs,
               announceSwitch: true,
             });
             if (s && ann.title) {
@@ -1836,7 +1956,7 @@ function createBridgeServer({ port = DEFAULT_PORT, onShowPanel, onCheckPixels, o
       broadcast('state:sync', snapshotState());
     },
     spawnTestSubagent: (payload) => subagentTracker?.spawnTestSubagent(payload),
-    clearSubagents: () => subagentTracker?.clearAll(),
+    clearSubagents: () => subagentTracker?.clearAll(activeConversationId),
   };
 }
 
