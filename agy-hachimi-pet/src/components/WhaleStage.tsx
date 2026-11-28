@@ -180,7 +180,8 @@ export const WhaleStage = forwardRef<WhaleControllerHandle, WhaleStageProps>(fun
   const exitTimersRef = useRef<Map<string, number>>(new Map());
   const [renderSubs, setRenderSubs] = useState<Array<SubagentItem & { exiting?: boolean }>>([]);
   const [subAnchors, setSubAnchors] = useState<Record<string, { x: number; y: number }>>({});
-  const kitRef = useRef<{ createPet: any; createWhaleFigure: any; origin: string } | null>(null);
+  const [kitReady, setKitReady] = useState(false);
+  const kitRef = useRef<{ createPet: any; createWhaleFigure: any; getRigStats?: () => Record<string, unknown>; origin: string } | null>(null);
 
   const speechStateRef = useRef<{ text: string; idx: number; nextAt: number }>({
     text: '',
@@ -245,14 +246,16 @@ export const WhaleStage = forwardRef<WhaleControllerHandle, WhaleStageProps>(fun
       if (!stage || !shadowEl || !petG || !fxG) return;
 
       const origin = window.location.origin;
-      const [{ createPet }, { createSfx }, { createWhaleFigure }] = await Promise.all([
+      const [{ createPet }, { createSfx }, { createWhaleFigure }, { getRigStats }] = await Promise.all([
         dynamicImport(`${origin}/coopanion/kit/body.js`),
         dynamicImport(`${origin}/coopanion/sound.js`),
         dynamicImport(`${origin}/coopanion/whale/figure.js`),
+        dynamicImport(`${origin}/coopanion/kit/rig.js`),
       ]);
       if (cancelled) return;
 
-      kitRef.current = { createPet, createWhaleFigure, origin };
+      kitRef.current = { createPet, createWhaleFigure, getRigStats, origin };
+      setKitReady(true);
 
       const sfx = createSfx({ storageKey: 'agy-whale-pet.sound', volume: 0.45 });
       sfx.set(settingsRef.current.soundOn);
@@ -428,6 +431,7 @@ export const WhaleStage = forwardRef<WhaleControllerHandle, WhaleStageProps>(fun
             canvasW: cv?.width ?? 0,
             canvasH: cv?.height ?? 0,
             subagentCount: subCtlsRef.current.size,
+            rigStats: kitRef.current?.getRigStats?.() || null,
             interactiveRects: hitSummary.validRects,
             skippedOversizedRects: hitSummary.skippedOversized,
           });
@@ -478,6 +482,8 @@ export const WhaleStage = forwardRef<WhaleControllerHandle, WhaleStageProps>(fun
       }
       subCtlsRef.current.clear();
       spawningIdsRef.current.clear();
+      kitRef.current = null;
+      setKitReady(false);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -638,7 +644,7 @@ export const WhaleStage = forwardRef<WhaleControllerHandle, WhaleStageProps>(fun
         }
       }, dropDelayMs);
     });
-  }, [subagents]);
+  }, [subagents, kitReady]);
 
   // Sync color scheme live for main pet
   useEffect(() => {

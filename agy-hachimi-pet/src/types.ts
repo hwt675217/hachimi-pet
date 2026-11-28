@@ -112,6 +112,8 @@ export interface SubagentItem {
   role: string;
   typeName?: string;
   source?: 'subagent' | 'teamwork' | 'swarm' | 'test';
+  parentConversationId?: string | null;
+  rootConversationId?: string | null;
   slotIndex?: number;
   scheme: string;
   outfit: string;

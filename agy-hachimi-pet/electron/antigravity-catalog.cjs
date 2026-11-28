@@ -45,15 +45,17 @@ function formatRelativeTime(tsMs) {
 
 function parseAnnotationPbtxt(raw, fallbackMtimeMs = 0) {
   const entry = {};
-  const titleMatch = raw.match(/title:\s*"((?:[^"\\]|\\.)*)"/);
-  const secMatch = raw.match(/seconds:\s*(\d+)/);
-  const nanosMatch = raw.match(/nanos:\s*(\d+)/);
+  const text = String(raw || '');
+  const titleMatch = text.match(/title:\s*"((?:[^"\\]|\\.)*)"/);
   if (titleMatch && titleMatch[1]) {
     try { entry.title = JSON.parse(`"${titleMatch[1]}"`); } catch { entry.title = titleMatch[1]; }
   }
+  const viewMatch = text.match(/last_user_view_time:\s*\{[^}]*seconds:\s*(\d+)(?:[^}]*nanos:\s*(\d+))?/);
+  const secMatch = viewMatch || text.match(/seconds:\s*(\d+)/);
+  const nanosRaw = viewMatch ? viewMatch[2] : text.match(/nanos:\s*(\d+)/)?.[1];
   if (secMatch && secMatch[1]) {
     const secMs = Number(secMatch[1]) * 1000;
-    const nanoMs = nanosMatch && nanosMatch[1] ? Math.floor(Number(nanosMatch[1]) / 1e6) : 0;
+    const nanoMs = nanosRaw ? Math.floor(Number(nanosRaw) / 1e6) : 0;
     entry.viewTimeMs = secMs + nanoMs;
   } else if (fallbackMtimeMs > 0) {
     entry.viewTimeMs = Math.floor(fallbackMtimeMs);
@@ -294,9 +296,14 @@ async function loadAntigravityCatalog() {
   }
 
   const childIds = new Set();
+  const childParentMap = new Map();
 
   for (const row of dbRows) {
     const [cid, dbTitle, rawPid, rawWuris, source, status, userInputTime, mtime, parentId, nestingDepth, agentName] = row;
+    const cleanParentId = parentId ? String(parentId).trim() : '';
+    if (cid && cleanParentId) {
+      childParentMap.set(cid, cleanParentId);
+    }
     if (parentId || Number(nestingDepth || 0) > 0 || (agentName && String(agentName).trim())) {
       childIds.add(cid);
       continue; // Skip subagent & swarm worker trajectories
@@ -407,6 +414,7 @@ async function loadAntigravityCatalog() {
 
   const sortedProjects = [...unpinned, ...pinned];
   sortedProjects.childIds = childIds;
+  sortedProjects.childParentMap = childParentMap;
   return sortedProjects;
 }
 
@@ -438,6 +446,7 @@ function isTranscriptLikelySubagent(transcriptPath) {
 module.exports = {
   ANNOTATIONS_DIR,
   loadAntigravityCatalog,
+  parseAnnotationPbtxt,
   readSingleAnnotation,
   isTranscriptLikelySubagent,
   findTranscriptPath,
